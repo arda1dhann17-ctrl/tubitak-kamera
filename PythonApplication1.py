@@ -37,14 +37,14 @@ BEKLEME_SANIYESI = 5
 IPTAL_TEYIT_SN = 1.0
 KAYIP_TOLERANS_SN = 2.0
 ALARM_KAYIP_TOLERANS_SN = 30.0
-FOTO_EKLE = True
-FOTO_KALITE = 70
-ORTAM_MOZAIK = 2
-KALABALIK_MOZAIK = 6
-GIZLEME_PAYI = 0.10
-GIZLEME_MIN_GORUNURLUK = 0.1
-GIZLEME_RENGI = (70, 70, 70)
-FOTO_DOSYAYA_KAYDET = False
+# Alarm resmi: kamera goruntusu DEGIL, bos zemin uzerine sadece iskelet cizimi.
+# Kamera pikseli, yuz veya video hicbir yere gonderilmez/kaydedilmez.
+ISKELET_RESMI_EKLE = True
+ISKELET_RESMI_OLCEK = 2
+ISKELET_RESMI_KALITE = 70
+ISKELET_ZEMIN_RENGI = (30, 30, 30)
+ISKELET_DOSYAYA_KAYDET = False
+TAKIP_MIN_GORUNURLUK = 0.1
 FPS_RAPOR_SN = 10
 
 
@@ -52,17 +52,17 @@ def veri_gonder(veri):
     # ╔═══════════════════════════════════════════════════════════════╗
     # ║  >>>>>  VERİNİN GİDECEĞİ YER BURASI (SİZ DOLDURACAKSINIZ)  <<<<<  ║
     # ╚═══════════════════════════════════════════════════════════════╝
-    # veri: sozluk. Fotograf "foto_jpg_base64" anahtarinda (base64 JPEG).
+    # veri: sozluk. Iskelet resmi "iskelet_jpg_base64" anahtarinda (base64 JPEG).
     gosterilecek = dict(veri)
-    if gosterilecek.get("foto_jpg_base64"):
-        kb = len(gosterilecek["foto_jpg_base64"]) * 3 // 4 / 1024
-        gosterilecek["foto_jpg_base64"] = f"<JPEG fotograf, yaklasik {kb:.0f} KB>"
+    if gosterilecek.get("iskelet_jpg_base64"):
+        kb = len(gosterilecek["iskelet_jpg_base64"]) * 3 // 4 / 1024
+        gosterilecek["iskelet_jpg_base64"] = f"<JPEG iskelet resmi, yaklasik {kb:.1f} KB>"
     print("[VERI] ->", json.dumps(gosterilecek, ensure_ascii=False))
 
 
 KLASOR = os.path.dirname(os.path.abspath(__file__))
 PENCERE_ADI = "Iskelet (video yok)"
-KANIT_PENCERESI = "Kanit fotosu"
+KANIT_PENCERESI = "Alarm iskelet resmi"
 FONT = cv2.FONT_HERSHEY_SIMPLEX
 BURUN = 0
 SOL_OMUZ, SAG_OMUZ = 11, 12
@@ -218,7 +218,7 @@ class Kisi:
 
 def kisileri_al(sonuc, genislik, yukseklik):
     kisiler = []
-    alt_sinir = min(MIN_GORUNURLUK, GIZLEME_MIN_GORUNURLUK)
+    alt_sinir = min(MIN_GORUNURLUK, TAKIP_MIN_GORUNURLUK)
     for poz in (sonuc.pose_landmarks or []):
         nokta, tum = {}, {}
         for no, n in enumerate(poz):
@@ -350,7 +350,7 @@ class Izleyici:
             kullanilan.add(sira)
         return eslesme
 
-    def guncelle(self, t, kisiler, kare):
+    def guncelle(self, t, kisiler):
         eslesme = self.eslestir(kisiler)
         eslesenler = set(eslesme.values())
 
@@ -371,7 +371,7 @@ class Izleyici:
                 kisi = kisiler[sira]
                 iz.kisi = kisi
                 iz.merkez, iz.boyut = kisi.merkez, kisi.boyut
-                iz.goruntu = (kare, kisiler, sira)
+                iz.goruntu = (kisiler, sira)
                 _, olay, iz.bilgi = iz.guncelle(t, kisi.nokta)
             if olay is not None:
                 olaylar.append((iz, olay))
@@ -395,63 +395,33 @@ def yazi_yaz(resim, metin, konum, renk, olcek=0.35):
     cv2.putText(resim, metin, konum, FONT, olcek, renk, 1)
 
 
-def mozaik(resim, blok):
-    if blok <= 1:
-        return resim
-    h, w = resim.shape[:2]
-    kucuk = cv2.resize(resim, (max(1, w // blok), max(1, h // blok)),
-                       interpolation=cv2.INTER_AREA)
-    return cv2.resize(kucuk, (w, h), interpolation=cv2.INTER_NEAREST)
+def iskelet_resmi(iz):
+    kisiler, sira = iz.goruntu
+    k = ISKELET_RESMI_OLCEK
+    w, h = GENISLIK * k, YUKSEKLIK * k
+    resim = np.full((h, w, 3), ISKELET_ZEMIN_RENGI, dtype=np.uint8)
 
-
-def kisiyi_gizle(foto, kisi):
-    noktalar = dict(kisi.tum)
-
-    omuz = ortalama_nokta(noktalar, (SOL_OMUZ, SAG_OMUZ))
-    if BURUN in noktalar and omuz is not None:
-        bx, by = noktalar[BURUN]
-        noktalar["bas_ustu"] = (bx + 0.7 * (bx - omuz[0]), by + 0.7 * (by - omuz[1]))
-
-    if not noktalar:
-        return
-    pts = np.array(list(noktalar.values()), dtype=np.float32)
-    boyut = max(float(pts[:, 0].max() - pts[:, 0].min()),
-                float(pts[:, 1].max() - pts[:, 1].min()), 1.0)
-    pay = max(4, int(GIZLEME_PAYI * boyut))
-
-    kabuk = cv2.convexHull(pts).astype(np.int32)
-    cv2.fillConvexPoly(foto, kabuk, GIZLEME_RENGI)
-    cv2.polylines(foto, [kabuk], True, GIZLEME_RENGI, 2 * pay + 1)
-    for x, y in pts.astype(np.int32):
-        cv2.circle(foto, (int(x), int(y)), pay, GIZLEME_RENGI, -1)
-
-
-def kanit_fotosu(iz):
-    kare, kisiler, sira = iz.goruntu
-    kalabalik = len(kisiler) >= EN_FAZLA_KISI
-
-    foto = kare.copy()
-    for kisi in kisiler:
-        kisiyi_gizle(foto, kisi)
-    foto = mozaik(foto, KALABALIK_MOZAIK if kalabalik else ORTAM_MOZAIK)
+    def olcekle(noktalar):
+        return {i: (p[0] * k, p[1] * k) for i, p in noktalar.items()}
 
     for i, kisi in enumerate(kisiler):
         if i != sira:
-            iskelet_ciz(foto, kisi.nokta, (0, 255, 0), (0, 200, 0))
+            iskelet_ciz(resim, olcekle(kisi.nokta), (0, 200, 0), (0, 200, 0))
     dusen = kisiler[sira]
-    iskelet_ciz(foto, dusen.nokta, (0, 0, 255), (0, 0, 255))
+    dusen_nokta = olcekle(dusen.nokta)
+    iskelet_ciz(resim, dusen_nokta, (0, 0, 255), (0, 0, 255))
 
-    h, w = foto.shape[:2]
-    xler = [p[0] for p in dusen.nokta.values()] or [dusen.merkez[0]]
-    yler = [p[1] for p in dusen.nokta.values()] or [dusen.merkez[1]]
-    ex = int(min(max((min(xler) + max(xler)) / 2 - 30, 2), w - 78))
-    ey = int(min(max(min(yler) - 8, 12), h - 4))
-    yazi_yaz(foto, f"DUSTU #{iz.kimlik}", (ex, ey), (0, 220, 255), 0.4)
+    xler = [p[0] for p in dusen_nokta.values()] or [dusen.merkez[0] * k]
+    yler = [p[1] for p in dusen_nokta.values()] or [dusen.merkez[1] * k]
+    ex = int(min(max((min(xler) + max(xler)) / 2 - 40, 2), w - 100))
+    ey = int(min(max(min(yler) - 10, 16), h - 4))
+    yazi_yaz(resim, f"DUSTU #{iz.kimlik}", (ex, ey), (0, 220, 255), 0.6)
     damga = f"{ISTASYON_ADI}  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-    yazi_yaz(foto, damga, (4, h - 6), (255, 255, 255), 0.35)
+    yazi_yaz(resim, damga, (6, h - 8), (255, 255, 255), 0.5)
 
-    basarili, tampon = cv2.imencode(".jpg", foto, [int(cv2.IMWRITE_JPEG_QUALITY), FOTO_KALITE])
-    return foto, (tampon.tobytes() if basarili else None), kalabalik
+    basarili, tampon = cv2.imencode(
+        ".jpg", resim, [int(cv2.IMWRITE_JPEG_QUALITY), ISKELET_RESMI_KALITE])
+    return resim, (tampon.tobytes() if basarili else None)
 
 
 def _tam(p):
@@ -566,7 +536,7 @@ def main():
 
                 t = time.monotonic()
                 kisiler = kisileri_al(sonuc, GENISLIK, YUKSEKLIK)
-                olaylar = izleyici.guncelle(t, kisiler, kare)
+                olaylar = izleyici.guncelle(t, kisiler)
 
                 for iz in izleyici.izler.values():
                     if iz.durum != iz.yazilan_durum:
@@ -575,18 +545,17 @@ def main():
 
                 for iz, olay in olaylar:
                     olay["gorunen_kisi_sayisi"] = len(kisiler)
-                    if olay["olay"] == "yerde_hareketsiz" and FOTO_EKLE:
-                        foto, jpeg, kalabalik = kanit_fotosu(iz)
+                    if olay["olay"] == "yerde_hareketsiz" and ISKELET_RESMI_EKLE:
+                        resim, jpeg = iskelet_resmi(iz)
                         if jpeg is not None:
-                            olay["foto_jpg_base64"] = base64.b64encode(jpeg).decode("ascii")
-                            olay["kalabalik_modu"] = kalabalik
-                            if FOTO_DOSYAYA_KAYDET:
-                                with open(os.path.join(KLASOR, "son_kanit.jpg"), "wb") as f:
+                            olay["iskelet_jpg_base64"] = base64.b64encode(jpeg).decode("ascii")
+                            if ISKELET_DOSYAYA_KAYDET:
+                                with open(os.path.join(KLASOR, "son_iskelet.jpg"), "wb") as f:
                                     f.write(jpeg)
                             if goster:
                                 cv2.namedWindow(KANIT_PENCERESI, cv2.WINDOW_NORMAL)
                                 cv2.resizeWindow(KANIT_PENCERESI, 640, 480)
-                                cv2.imshow(KANIT_PENCERESI, foto)
+                                cv2.imshow(KANIT_PENCERESI, resim)
                     try:
                         veri_gonder(olay)
                     except Exception as hata:
@@ -619,4 +588,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()x
+    main()
