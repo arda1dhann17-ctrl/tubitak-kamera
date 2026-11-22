@@ -31,6 +31,24 @@ MODEL_ADRESI = ("https://storage.googleapis.com/mediapipe-models/pose_landmarker
 MIN_GORUNURLUK = 0.5
 YATIS_ACISI = 50
 YATIS_EN_BOY = 1.0
+# Bacak acisi: kalca -> ayak bilegi (gorunmuyorsa diz) cizgisinin dikeyle acisi.
+# Egilip bir sey alirken ya da ayakkabi baglarken govde yatsa bile bacaklar dik
+# kalir; yere yatan kiside bacaklar da yataydir.
+BACAK_YATIS_ACISI = 45
+# Ani dusus (aci + hiz): govde DUSUS_PENCERESI saniye icinde dik durustan
+# (aci <= DIK_ACI) yatay duruma gecmeli, govde merkezi en az boy x DUSUS_MESAFESI
+# asagi inmeli ve govde en az DUSUS_ACI_HIZI derece/sn hizla devrilmeli.
+DIK_ACI = 35
+DUSUS_PENCERESI = 1.5
+DUSUS_MESAFESI = 0.25
+DUSUS_ACI_HIZI = 60
+# Ani dusus goruldukten sonra alarm icin kisinin yerde kalmasi gereken sure.
+# Dusus ~1 sn + bu sure = 3 sn hedefinin icinde alarm.
+DUSUS_TEYIT_SN = 1.5
+# Bunun altindaki kare hizinda ani dusus kacabilir; FPS raporunda uyari verilir.
+MIN_GUVENLI_FPS = 3
+# Ani dusus gorulmeden yere yatmis (yavasca cokmus) kisi icin: yerde ve
+# hareketsiz kalmasi gereken sure BEKLEME_SANIYESI'dir.
 HAREKET_PENCERESI = 1.0
 HAREKET_ESIGI = 0.04
 BEKLEME_SANIYESI = 5
@@ -67,6 +85,8 @@ FONT = cv2.FONT_HERSHEY_SIMPLEX
 BURUN = 0
 SOL_OMUZ, SAG_OMUZ = 11, 12
 SOL_KALCA, SAG_KALCA = 23, 24
+SOL_DIZ, SAG_DIZ = 25, 26
+SOL_AYAK_BILEGI, SAG_AYAK_BILEGI = 27, 28
 HAREKET_NOKTALARI = (0, 11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28)
 BAGLANTILAR = (
     (0, 1), (1, 2), (2, 3), (3, 7), (0, 4), (4, 5), (5, 6), (6, 8), (9, 10),
@@ -178,6 +198,53 @@ def durus_olc(noktalar):
     return aci, en_boy, boyut
 
 
+def bacak_acisi_olc(noktalar):
+    kalca = ortalama_nokta(noktalar, (SOL_KALCA, SAG_KALCA))
+    ayak = (ortalama_nokta(noktalar, (SOL_AYAK_BILEGI, SAG_AYAK_BILEGI))
+            or ortalama_nokta(noktalar, (SOL_DIZ, SAG_DIZ)))
+    if kalca is None or ayak is None:
+        return None
+    dx = ayak[0] - kalca[0]
+    dy = ayak[1] - kalca[1]
+    if math.hypot(dx, dy) < 1.0:
+        return None
+    return math.degrees(math.atan2(abs(dx), abs(dy)))
+
+
+def govde_merkezi(noktalar):
+    return ortalama_nokta(noktalar, (SOL_OMUZ, SAG_OMUZ, SOL_KALCA, SAG_KALCA))
+
+
+class DususOlcer:
+    """Govdenin kisa surede dik durustan yataya ve asagi dogru hizla
+    gecip gecmedigini olcer (aci + hiz). Yavas egilme, comelme veya
+    yere kendi istegiyle uzanma ani dusus sayilmaz."""
+
+    def __init__(self, pencere_sn):
+        self.pencere = pencere_sn
+        self.gecmis = deque()
+
+    def olc(self, t, aci, merkez_y, boyut, yatiyor):
+        self.gecmis.append((t, aci, merkez_y, boyut))
+        while self.gecmis and t - self.gecmis[0][0] > self.pencere:
+            self.gecmis.popleft()
+        if not yatiyor:
+            return None
+        en_iyi = None
+        for t_eski, aci_eski, y_eski, boyut_eski in self.gecmis:
+            dt = t - t_eski
+            if dt <= 0 or aci_eski > DIK_ACI:
+                continue
+            olcek = max(boyut, boyut_eski, 1.0)
+            inis = (merkez_y - y_eski) / olcek
+            aci_hizi = (aci - aci_eski) / dt
+            if inis >= DUSUS_MESAFESI and aci_hizi >= DUSUS_ACI_HIZI:
+                if en_iyi is None or t_eski < en_iyi["baslangic"]:
+                    en_iyi = {"baslangic": t_eski, "inis": inis,
+                              "aci_hizi": aci_hizi, "sure": dt}
+        return en_iyi
+
+
 class HareketOlcer:
 
     def __init__(self, pencere_sn):
@@ -239,9 +306,12 @@ class DusmeTakipcisi:
     def __init__(self, kimlik=0):
         self.kimlik = kimlik
         self.olcer = HareketOlcer(HAREKET_PENCERESI)
+        self.dusus_olcer = DususOlcer(DUSUS_PENCERESI)
         self.durum = "NORMAL"
         self.sayac_basi = None
         self.iptal_basi = None
+        self.dusus = None
+        self.bekleme = BEKLEME_SANIYESI
         self.son_gorulen = None
         self.merkez = None
         self.boyut = None
@@ -255,23 +325,34 @@ class DusmeTakipcisi:
         self.durum = "NORMAL"
         self.sayac_basi = None
         self.iptal_basi = None
+        self.dusus = None
+        self.bekleme = BEKLEME_SANIYESI
+
+    def dusus_kaydet(self, dusus):
+        if dusus is not None and self.dusus is None:
+            self.dusus = dusus
+            self.bekleme = DUSUS_TEYIT_SN
 
     def kayip_mi(self, t):
         tolerans = ALARM_KAYIP_TOLERANS_SN if self.durum == "ALARM" else KAYIP_TOLERANS_SN
         return self.son_gorulen is None or (t - self.son_gorulen) > tolerans
 
     def olay_olustur(self, tur, t):
-        return {
+        olay = {
             "istasyon": ISTASYON_ADI,
             "olay": tur,
             "kisi_no": self.kimlik,
             "zaman": datetime.now().isoformat(timespec="seconds"),
             "yerde_kalma_sn": round(t - self.sayac_basi, 1),
+            "ani_dusus": self.dusus is not None,
         }
+        if self.dusus is not None:
+            olay["dusus_baslangicindan_sn"] = round(t - self.dusus["baslangic"], 1)
+        return olay
 
     def guncelle(self, t, noktalar):
         bilgi = {"aci": None, "en_boy": None, "hareket": None,
-                 "yatiyor": None, "gecen": None}
+                 "yatiyor": None, "gecen": None, "bacak": None, "dusus": False}
         olay = None
 
         if noktalar is None:
@@ -285,22 +366,31 @@ class DusmeTakipcisi:
             return self.durum, olay, bilgi
         aci, en_boy, boyut = olcum
 
-        yatiyor = (aci >= YATIS_ACISI) and (en_boy >= YATIS_EN_BOY)
+        bacak = bacak_acisi_olc(noktalar)
+        bacak_yatay = (bacak is None) or (bacak >= BACAK_YATIS_ACISI)
+        yatiyor = (aci >= YATIS_ACISI) and (en_boy >= YATIS_EN_BOY) and bacak_yatay
         hareket = self.olcer.olc(t, noktalar, boyut)
         hareketsiz = (hareket is None) or (hareket < HAREKET_ESIGI)
+        merkez = govde_merkezi(noktalar)
+        dusus = self.dusus_olcer.olc(t, aci, merkez[1], boyut, yatiyor)
 
-        bilgi.update(aci=aci, en_boy=en_boy, hareket=hareket, yatiyor=yatiyor)
+        bilgi.update(aci=aci, en_boy=en_boy, hareket=hareket, yatiyor=yatiyor,
+                     bacak=bacak, dusus=dusus is not None)
 
         if self.durum == "NORMAL":
-            if yatiyor and hareketsiz:
+            if yatiyor and (dusus is not None or hareketsiz):
                 self.durum = "SAYIYOR"
                 self.sayac_basi = t
                 self.iptal_basi = None
+                self.dusus_kaydet(dusus)
 
         elif self.durum == "SAYIYOR":
-            if yatiyor and hareketsiz:
+            self.dusus_kaydet(dusus)
+            # Ani dusus gorulduyse yerde kipirdamasi alarmi engellemez;
+            # gorulmediyse (yavas cokme) hareketsiz kalmasi gerekir.
+            if yatiyor and (self.dusus is not None or hareketsiz):
                 self.iptal_basi = None
-                if t - self.sayac_basi >= BEKLEME_SANIYESI:
+                if t - self.sayac_basi >= self.bekleme:
                     self.durum = "ALARM"
                     olay = self.olay_olustur("yerde_hareketsiz", t)
             else:
@@ -491,7 +581,9 @@ def bilgi_yaz(tuval, izleyici, t, kisi_sayisi):
     elif sayan:
         iz = max(sayan, key=lambda i: t - i.sayac_basi)
         durum = "SAYIYOR"
-        metin = f"SAYIYOR #{iz.kimlik}  {t - iz.sayac_basi:.1f}/{BEKLEME_SANIYESI} sn"
+        metin = f"SAYIYOR #{iz.kimlik}  {t - iz.sayac_basi:.1f}/{iz.bekleme:g} sn"
+        if iz.dusus is not None:
+            metin += " DUSUS"
     else:
         durum, metin = "NORMAL", "NORMAL"
     cv2.putText(tuval, metin, (6, 20), FONT, 0.6, DURUM_RENKLERI[durum], 2)
@@ -602,8 +694,13 @@ def main():
 
                 rapor_kare += 1
                 if FPS_RAPOR_SN > 0 and t - rapor_zamani >= FPS_RAPOR_SN:
-                    print(f"[HIZ] {rapor_kare / (t - rapor_zamani):.1f} kare/sn "
+                    fps = rapor_kare / (t - rapor_zamani)
+                    print(f"[HIZ] {fps:.1f} kare/sn "
                           f"(son karede {len(kisiler)} kisi)")
+                    if fps < MIN_GUVENLI_FPS:
+                        print(f"[UYARI] Hiz {MIN_GUVENLI_FPS} kare/sn altinda; ani dusus "
+                              "kacabilir ve 3 sn hedefi tutmayabilir. GENISLIK/YUKSEKLIK "
+                              "veya EN_FAZLA_KISI degerini dusurmeyi deneyin.")
                     rapor_zamani, rapor_kare = t, 0
 
                 kalan = kare_suresi - (time.monotonic() - dongu_basi)
@@ -619,4 +716,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()x
+    main()
