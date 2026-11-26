@@ -38,15 +38,28 @@ IPTAL_TEYIT_SN = 1.0
 KAYIP_TOLERANS_SN = 2.0
 ALARM_KAYIP_TOLERANS_SN = 30.0
 # Alarm resmi: arka planda atolye ortami, insanlar YALNIZCA iskelet olarak.
-# Ortam resmi, insan olmayan anlardan ogrenilir (insan bolgeleri hic ogrenilmez),
-# bu yuzden resimde kimsenin yuzu/vucudu gorunmez. Video kaydedilmez.
+# Ortam resmi bir kez "kalibrasyon" ile kaydedilir: oda bosken birkac dakika
+# boyunca, icinde hic insan bulunmayan kareler toplanip medyanlari alinir.
+# Sonra resim sabit kalir (surekli ogrenme yok), boyle insanlar ona karisamaz.
+# Ortam degisirse yeniden kalibrasyon baslatilir (pencerede "k" tusu,
+# klasore "arka_plan_kaydet" adli bos dosya koymak veya MQTT komutu).
 ISKELET_RESMI_EKLE = True
 ISKELET_RESMI_OLCEK = 2
 ISKELET_RESMI_KALITE = 70
 ISKELET_ZEMIN_RENGI = (60, 60, 60)  # ortami henuz bilinmeyen yerler
 ARKA_PLAN_KULLAN = True
-ARKA_OGRENME_HIZI = 0.02  # 5 FPS'te ~10 sn'de ortam degisikligine uyar
-ARKA_INSAN_PAYI = 0.25    # insan bolgesine eklenen guvenlik payi (boyun orani)
+ARKA_PLAN_DOSYASI = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "arka_plan.png")
+ACILISTA_KALIBRASYON = True   # kayitli arka plan yoksa acilista kalibrasyon yap
+KALIBRASYON_SN = 300          # 5 dakika; bu surede oda bos birakilmali
+KALIBRASYON_ORNEK_ARALIGI = 3.0  # kac saniyede bir ornek kare alinsin
+KALIBRASYON_MIN_ORNEK = 20    # bu kadar insansiz kare toplanmadan bitmez
+KALIBRASYON_TETIK_DOSYASI = "arka_plan_kaydet"
+# Ileride mobil uygulamadaki "ortami kaydet" tusu bu konuya mesaj atacak.
+# paho-mqtt kurulu degilse veya broker yoksa bu ozellik sessizce kapali kalir.
+MQTT_KOMUT_DINLE = True
+MQTT_SUNUCU, MQTT_PORT = "localhost", 1883
+MQTT_KOMUT_KONUSU = f"atolye/{ISTASYON_ADI}/komut"
 ISKELET_DOSYAYA_KAYDET = False
 TAKIP_MIN_GORUNURLUK = 0.1
 FPS_RAPOR_SN = 10
@@ -62,6 +75,13 @@ def veri_gonder(veri):
         kb = len(gosterilecek["iskelet_jpg_base64"]) * 3 // 4 / 1024
         gosterilecek["iskelet_jpg_base64"] = f"<JPEG iskelet resmi, yaklasik {kb:.1f} KB>"
     print("[VERI] ->", json.dumps(gosterilecek, ensure_ascii=False))
+
+
+def guvenli_gonder(veri):
+    try:
+        veri_gonder(veri)
+    except Exception as hata:
+        print("[HATA] Veri gonderilemedi:", hata)
 
 
 KLASOR = os.path.dirname(os.path.abspath(__file__))
@@ -399,48 +419,120 @@ def yazi_yaz(resim, metin, konum, renk, olcek=0.35):
     cv2.putText(resim, metin, konum, FONT, olcek, renk, 1)
 
 
-def insan_maskesi(maske, kisi):
-    noktalar = dict(kisi.tum or kisi.nokta)
-    omuz = ortalama_nokta(noktalar, (SOL_OMUZ, SAG_OMUZ))
-    if BURUN in noktalar and omuz is not None:
-        bx, by = noktalar[BURUN]
-        noktalar["bas_ustu"] = (bx + 0.8 * (bx - omuz[0]), by + 0.8 * (by - omuz[1]))
-    if not noktalar:
-        return
-    pts = np.array(list(noktalar.values()), dtype=np.float32)
-    boyut = max(float(pts[:, 0].max() - pts[:, 0].min()),
-                float(pts[:, 1].max() - pts[:, 1].min()), 1.0)
-    pay = max(8, int(ARKA_INSAN_PAYI * boyut))
-    kabuk = cv2.convexHull(pts).astype(np.int32)
-    cv2.fillConvexPoly(maske, kabuk, 255)
-    cv2.polylines(maske, [kabuk], True, 255, 2 * pay + 1)
-    for x, y in pts.astype(np.int32):
-        cv2.circle(maske, (int(x), int(y)), pay, 255, -1)
-
-
 class ArkaPlan:
-    """Atolyenin insansiz halini ogrenir. Insan olan pikseller hic guncellenmez."""
+    """Atolyenin bos halini kalibrasyonla kaydeder; sonra sabit kalir."""
 
     def __init__(self, genislik, yukseklik):
-        self.resim = np.zeros((yukseklik, genislik, 3), dtype=np.float32)
-        self.bilinen = np.zeros((yukseklik, genislik), dtype=np.uint8)
-        self.maske = np.zeros((yukseklik, genislik), dtype=np.uint8)
+        self.boyut = (yukseklik, genislik)
+        self.resim = None
+        self.ornekler = []
+        self.kalib_basi = None
+        self.son_ornek = None
+        self.uyarildi = False
+        if os.path.exists(ARKA_PLAN_DOSYASI):
+            resim = cv2.imread(ARKA_PLAN_DOSYASI)
+            if resim is not None and resim.shape[:2] == self.boyut:
+                self.resim = resim
+                print("[ARKA PLAN] Kayitli atolye resmi yuklendi:", ARKA_PLAN_DOSYASI)
 
-    def guncelle(self, kare, kisiler):
-        self.maske[:] = 0
-        for kisi in kisiler:
-            insan_maskesi(self.maske, kisi)
-        bos = cv2.bitwise_not(self.maske)
-        yeni = cv2.bitwise_and(bos, cv2.bitwise_not(self.bilinen))
-        np.copyto(self.resim, kare.astype(np.float32), where=(yeni > 0)[..., None])
-        eski = cv2.bitwise_and(bos, self.bilinen)
-        cv2.accumulateWeighted(kare, self.resim, ARKA_OGRENME_HIZI, mask=eski)
-        cv2.bitwise_or(self.bilinen, bos, dst=self.bilinen)
+    @property
+    def kalibre_ediliyor(self):
+        return self.kalib_basi is not None
+
+    def kalibrasyon_baslat(self, t):
+        self.ornekler = []
+        self.kalib_basi = t
+        self.son_ornek = None
+        self.uyarildi = False
+        print(f"[ARKA PLAN] Kalibrasyon basladi: {KALIBRASYON_SN} sn boyunca "
+              "oda bos birakilmali.")
+
+    def kalan_sn(self, t):
+        return max(0.0, KALIBRASYON_SN - (t - self.kalib_basi))
+
+    def guncelle(self, t, kare, kisiler):
+        """Kalibrasyon bittiyse olay adi dondurur, yoksa None."""
+        if not self.kalibre_ediliyor:
+            return None
+        bos_oda = not kisiler
+        if bos_oda and (self.son_ornek is None
+                        or t - self.son_ornek >= KALIBRASYON_ORNEK_ARALIGI):
+            self.ornekler.append(kare.copy())
+            self.son_ornek = t
+        if self.kalan_sn(t) > 0:
+            return None
+        if len(self.ornekler) < KALIBRASYON_MIN_ORNEK:
+            if not self.uyarildi:
+                print(f"[ARKA PLAN] Odada insan goruldugu icin yeterli bos kare yok "
+                      f"({len(self.ornekler)}/{KALIBRASYON_MIN_ORNEK}). "
+                      "Oda bosalana kadar devam ediliyor.")
+                self.uyarildi = True
+            return None
+        # Medyan: ornek karelerin birinde kisa sureligine gorunen biri olsa bile silinir.
+        self.resim = np.median(np.stack(self.ornekler), axis=0).astype(np.uint8)
+        self.ornekler = []
+        self.kalib_basi = None
+        try:
+            cv2.imwrite(ARKA_PLAN_DOSYASI, self.resim)
+            print("[ARKA PLAN] Kalibrasyon bitti, kaydedildi:", ARKA_PLAN_DOSYASI)
+        except Exception as hata:
+            print("[HATA] Arka plan kaydedilemedi:", hata)
+        return "arka_plan_kaydedildi"
 
     def goruntu(self):
-        resim = self.resim.astype(np.uint8)
-        resim[self.bilinen == 0] = ISKELET_ZEMIN_RENGI
-        return resim
+        if self.resim is None:
+            return np.full(self.boyut + (3,), ISKELET_ZEMIN_RENGI, dtype=np.uint8)
+        return self.resim
+
+
+class KomutDinleyici:
+    """Disaridan gelen komutlari toplar (MQTT ve tetik dosyasi)."""
+
+    def __init__(self):
+        self.bekleyen = []
+        self.istemci = None
+        if MQTT_KOMUT_DINLE:
+            self._mqtt_baslat()
+
+    def _mqtt_baslat(self):
+        try:
+            import paho.mqtt.client as mqtt
+        except ImportError:
+            print("[KOMUT] paho-mqtt kurulu degil; MQTT komutlari kapali.")
+            return
+        try:
+            try:
+                istemci = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+            except AttributeError:
+                istemci = mqtt.Client()
+
+            def mesaj_geldi(_istemci, _veri, mesaj):
+                self.bekleyen.append(mesaj.payload.decode("utf-8", "ignore").strip())
+
+            istemci.on_message = mesaj_geldi
+            istemci.connect(MQTT_SUNUCU, MQTT_PORT, 30)
+            istemci.subscribe(MQTT_KOMUT_KONUSU)
+            istemci.loop_start()
+            self.istemci = istemci
+            print(f"[KOMUT] MQTT dinleniyor: {MQTT_KOMUT_KONUSU}")
+        except Exception as hata:
+            print(f"[KOMUT] MQTT baglantisi kurulamadi ({hata}); MQTT komutlari kapali.")
+
+    def al(self):
+        tetik = os.path.join(KLASOR, KALIBRASYON_TETIK_DOSYASI)
+        if os.path.exists(tetik):
+            try:
+                os.remove(tetik)
+            except OSError:
+                pass
+            self.bekleyen.append("arka_plan_kaydet")
+        komutlar, self.bekleyen = self.bekleyen, []
+        return komutlar
+
+    def kapat(self):
+        if self.istemci is not None:
+            self.istemci.loop_stop()
+            self.istemci.disconnect()
 
 
 def iskelet_resmi(iz, arka_plan=None):
@@ -546,6 +638,10 @@ def main():
 
     izleyici = Izleyici()
     arka_plan = ArkaPlan(GENISLIK, YUKSEKLIK) if ARKA_PLAN_KULLAN else None
+    if arka_plan is not None and arka_plan.resim is None and ACILISTA_KALIBRASYON:
+        arka_plan.kalibrasyon_baslat(time.monotonic())
+    komutlar = KomutDinleyici()
+    kalibrasyon_iste = False
     secenekler = vision.PoseLandmarkerOptions(
         base_options=mp_python.BaseOptions(model_asset_path=MODEL_DOSYASI),
         running_mode=vision.RunningMode.VIDEO,
@@ -589,8 +685,22 @@ def main():
                 t = time.monotonic()
                 kisiler = kisileri_al(sonuc, GENISLIK, YUKSEKLIK)
                 olaylar = izleyici.guncelle(t, kisiler)
+                for komut in komutlar.al():
+                    if komut == "arka_plan_kaydet":
+                        kalibrasyon_iste = True
+                    else:
+                        print("[KOMUT] Bilinmeyen komut:", komut)
                 if arka_plan is not None:
-                    arka_plan.guncelle(kare, kisiler)
+                    if kalibrasyon_iste:
+                        arka_plan.kalibrasyon_baslat(t)
+                        guvenli_gonder({"istasyon": ISTASYON_ADI, "olay": "kalibrasyon_basladi",
+                                     "sure_sn": KALIBRASYON_SN,
+                                     "zaman": datetime.now().isoformat(timespec="seconds")})
+                    kalib_olay = arka_plan.guncelle(t, kare, kisiler)
+                    if kalib_olay is not None:
+                        guvenli_gonder({"istasyon": ISTASYON_ADI, "olay": kalib_olay,
+                                     "zaman": datetime.now().isoformat(timespec="seconds")})
+                kalibrasyon_iste = False
 
                 for iz in izleyici.izler.values():
                     if iz.durum != iz.yazilan_durum:
@@ -619,9 +729,16 @@ def main():
                     tuval = np.zeros((YUKSEKLIK, GENISLIK, 3), dtype=np.uint8)
                     canli_ciz(tuval, izleyici)
                     bilgi_yaz(tuval, izleyici, t, len(kisiler))
+                    if arka_plan is not None and arka_plan.kalibre_ediliyor:
+                        cv2.putText(tuval, f"KALIBRASYON: odayi bosaltin "
+                                    f"{arka_plan.kalan_sn(t):.0f} sn",
+                                    (6, 40), FONT, 0.45, (255, 200, 0), 1)
                     cv2.imshow(PENCERE_ADI, tuval)
-                    if cv2.waitKey(1) & 0xFF == ord("q"):
+                    tus = cv2.waitKey(1) & 0xFF
+                    if tus == ord("q"):
                         break
+                    if tus == ord("k"):
+                        kalibrasyon_iste = True
 
                 rapor_kare += 1
                 if FPS_RAPOR_SN > 0 and t - rapor_zamani >= FPS_RAPOR_SN:
@@ -637,6 +754,7 @@ def main():
         print("\n[DURDU] Kullanici durdurdu.")
     finally:
         kamera.kapat()
+        komutlar.kapat()
         if goster:
             cv2.destroyAllWindows()
 
