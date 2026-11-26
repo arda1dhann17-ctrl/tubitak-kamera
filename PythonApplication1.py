@@ -5,6 +5,7 @@ import json
 import math
 import os
 import sys
+import threading
 import time
 import urllib.request
 from collections import deque
@@ -42,7 +43,7 @@ ALARM_KAYIP_TOLERANS_SN = 30.0
 # boyunca, icinde hic insan bulunmayan kareler toplanip medyanlari alinir.
 # Sonra resim sabit kalir (surekli ogrenme yok), boyle insanlar ona karisamaz.
 # Ortam degisirse yeniden kalibrasyon baslatilir (pencerede "k" tusu,
-# klasore "arka_plan_kaydet" adli bos dosya koymak veya MQTT komutu).
+# klasore "arka_plan_kaydet" adli bos dosya koymak veya MQTT "arka_plan_kaydet").
 ISKELET_RESMI_EKLE = True
 ISKELET_RESMI_OLCEK = 2
 ISKELET_RESMI_KALITE = 70
@@ -55,26 +56,48 @@ KALIBRASYON_SN = 300          # 5 dakika; bu surede oda bos birakilmali
 KALIBRASYON_ORNEK_ARALIGI = 3.0  # kac saniyede bir ornek kare alinsin
 KALIBRASYON_MIN_ORNEK = 20    # bu kadar insansiz kare toplanmadan bitmez
 KALIBRASYON_TETIK_DOSYASI = "arka_plan_kaydet"
-# Ileride mobil uygulamadaki "ortami kaydet" tusu bu konuya mesaj atacak.
-# paho-mqtt kurulu degilse veya broker yoksa bu ozellik sessizce kapali kalir.
-MQTT_KOMUT_DINLE = True
+
+# --- MQTT: broker (Mosquitto) Pi'nin kendisinde calisir, uygulama ona baglanir ---
+#   atolye/<istasyon>/dusme  : yerde_hareketsiz (iskelet resmiyle), kisi_kalkti
+#   atolye/<istasyon>/gaz    : gaz_alarmi, duman_alarmi, gaz_temiz, duman_temiz
+#   atolye/<istasyon>/olcum  : sensor degerleri (son deger saklanir / retain)
+#   atolye/<istasyon>/durum  : cevrimici/cevrimdisi, kalibrasyon, arduino (retain)
+#   atolye/<istasyon>/komut  : uygulamadan gelen komutlar: arka_plan_kaydet, sustur
+# paho-mqtt kurulu degilse MQTT kapali kalir, program yine calisir.
+MQTT_KULLAN = True
 MQTT_SUNUCU, MQTT_PORT = "localhost", 1883
-MQTT_KOMUT_KONUSU = f"atolye/{ISTASYON_ADI}/komut"
+MQTT_KONU_KOKU = f"atolye/{ISTASYON_ADI}"
+
+# --- Arduino (USB seri): gaz/duman sensorleri, buzzer, RGB isik ---
+# pyserial kurulu degilse veya Arduino takili degilse bu kisim kapali kalir.
+ARDUINO_KULLAN = True
+ARDUINO_PORT = "otomatik"   # ya da "/dev/ttyACM0", Windows'ta "COM3" gibi
+ARDUINO_HIZ = 9600
+ARDUINO_PING_SN = 10        # Arduino, Pi'den 30 sn haber alamazsa mavi yanip soner
 ISKELET_DOSYAYA_KAYDET = False
 TAKIP_MIN_GORUNURLUK = 0.1
 FPS_RAPOR_SN = 10
 
 
+OLAY_KONULARI = {
+    "yerde_hareketsiz": "dusme", "kisi_kalkti": "dusme",
+    "gaz_alarmi": "gaz", "duman_alarmi": "gaz", "gaz_temiz": "gaz", "duman_temiz": "gaz",
+    "olcum": "olcum",
+}
+MQTT = None  # main() icinde MqttBaglanti ile doldurulur
+
+
 def veri_gonder(veri):
-    # ╔═══════════════════════════════════════════════════════════════╗
-    # ║  >>>>>  VERİNİN GİDECEĞİ YER BURASI (SİZ DOLDURACAKSINIZ)  <<<<<  ║
-    # ╚═══════════════════════════════════════════════════════════════╝
     # veri: sozluk. Iskelet resmi "iskelet_jpg_base64" anahtarinda (base64 JPEG).
-    gosterilecek = dict(veri)
-    if gosterilecek.get("iskelet_jpg_base64"):
-        kb = len(gosterilecek["iskelet_jpg_base64"]) * 3 // 4 / 1024
-        gosterilecek["iskelet_jpg_base64"] = f"<JPEG iskelet resmi, yaklasik {kb:.1f} KB>"
-    print("[VERI] ->", json.dumps(gosterilecek, ensure_ascii=False))
+    alt_konu = OLAY_KONULARI.get(veri.get("olay"), "durum")
+    if alt_konu != "olcum":
+        gosterilecek = dict(veri)
+        if gosterilecek.get("iskelet_jpg_base64"):
+            kb = len(gosterilecek["iskelet_jpg_base64"]) * 3 // 4 / 1024
+            gosterilecek["iskelet_jpg_base64"] = f"<JPEG iskelet resmi, yaklasik {kb:.1f} KB>"
+        print(f"[VERI] {alt_konu} ->", json.dumps(gosterilecek, ensure_ascii=False))
+    if MQTT is not None:
+        MQTT.yayinla(alt_konu, veri, saklansin=(alt_konu == "olcum"))
 
 
 def guvenli_gonder(veri):
@@ -485,54 +508,235 @@ class ArkaPlan:
         return self.resim
 
 
-class KomutDinleyici:
-    """Disaridan gelen komutlari toplar (MQTT ve tetik dosyasi)."""
+class MqttBaglanti:
+    """Pi'deki broker'a baglanir; olaylari yayinlar, komut konusunu dinler.
+    Broker o an yoksa arka planda tekrar tekrar baglanmayi dener."""
 
     def __init__(self):
-        self.bekleyen = []
         self.istemci = None
-        if MQTT_KOMUT_DINLE:
-            self._mqtt_baslat()
-
-    def _mqtt_baslat(self):
+        self.komutlar = deque()
+        self.bagli = False
         try:
             import paho.mqtt.client as mqtt
         except ImportError:
-            print("[KOMUT] paho-mqtt kurulu degil; MQTT komutlari kapali.")
+            print("[MQTT] paho-mqtt kurulu degil; MQTT kapali (pip install paho-mqtt).")
             return
         try:
-            try:
-                istemci = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
-            except AttributeError:
-                istemci = mqtt.Client()
-
-            def mesaj_geldi(_istemci, _veri, mesaj):
-                self.bekleyen.append(mesaj.payload.decode("utf-8", "ignore").strip())
-
-            istemci.on_message = mesaj_geldi
-            istemci.connect(MQTT_SUNUCU, MQTT_PORT, 30)
-            istemci.subscribe(MQTT_KOMUT_KONUSU)
+            istemci = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2,
+                                  client_id=f"istasyon-{ISTASYON_ADI}")
+        except AttributeError:
+            istemci = mqtt.Client(client_id=f"istasyon-{ISTASYON_ADI}")
+        istemci.will_set(f"{MQTT_KONU_KOKU}/durum",
+                         json.dumps({"istasyon": ISTASYON_ADI, "olay": "cevrimdisi"}),
+                         qos=1, retain=True)
+        istemci.on_connect = self._baglandi
+        istemci.on_disconnect = self._koptu
+        istemci.on_message = self._mesaj
+        istemci.reconnect_delay_set(1, 30)
+        try:
+            istemci.connect_async(MQTT_SUNUCU, MQTT_PORT, 30)
             istemci.loop_start()
-            self.istemci = istemci
-            print(f"[KOMUT] MQTT dinleniyor: {MQTT_KOMUT_KONUSU}")
         except Exception as hata:
-            print(f"[KOMUT] MQTT baglantisi kurulamadi ({hata}); MQTT komutlari kapali.")
+            print(f"[MQTT] Baslatilamadi ({hata}); MQTT kapali.")
+            return
+        self.istemci = istemci
+
+    def _baglandi(self, istemci, _veri, _bayrak, kod, *_):
+        if getattr(kod, "is_failure", kod != 0):
+            print("[MQTT] Baglanti reddedildi:", kod)
+            return
+        self.bagli = True
+        istemci.subscribe(f"{MQTT_KONU_KOKU}/komut", qos=1)
+        self.yayinla("durum", {"istasyon": ISTASYON_ADI, "olay": "cevrimici"}, saklansin=True)
+        print(f"[MQTT] Baglandi: {MQTT_SUNUCU}:{MQTT_PORT}, konular {MQTT_KONU_KOKU}/...")
+
+    def _koptu(self, *_):
+        if self.bagli:
+            print("[MQTT] Baglanti koptu, tekrar denenecek.")
+        self.bagli = False
+
+    def _mesaj(self, _istemci, _veri, mesaj):
+        metin = mesaj.payload.decode("utf-8", "ignore").strip()
+        try:
+            metin = json.loads(metin).get("komut", metin)
+        except (ValueError, AttributeError):
+            pass
+        self.komutlar.append(str(metin).strip().lower())
+
+    def yayinla(self, alt_konu, veri, saklansin=False):
+        if self.istemci is None:
+            return
+        self.istemci.publish(f"{MQTT_KONU_KOKU}/{alt_konu}",
+                             json.dumps(veri, ensure_ascii=False), qos=1, retain=saklansin)
+
+    def kapat(self):
+        if self.istemci is None:
+            return
+        if self.bagli:
+            bilgi = self.istemci.publish(
+                f"{MQTT_KONU_KOKU}/durum",
+                json.dumps({"istasyon": ISTASYON_ADI, "olay": "cevrimdisi"}),
+                qos=1, retain=True)
+            try:
+                bilgi.wait_for_publish(2)
+            except Exception:
+                pass
+        self.bagli = False
+        self.istemci.loop_stop()
+        self.istemci.disconnect()
+
+
+class KomutDinleyici:
+    """Disaridan gelen komutlari toplar (MQTT ve tetik dosyasi)."""
+
+    def __init__(self, mqtt=None):
+        self.mqtt = mqtt
 
     def al(self):
+        komutlar = []
+        if self.mqtt is not None:
+            while self.mqtt.komutlar:
+                komutlar.append(self.mqtt.komutlar.popleft())
         tetik = os.path.join(KLASOR, KALIBRASYON_TETIK_DOSYASI)
         if os.path.exists(tetik):
             try:
                 os.remove(tetik)
             except OSError:
                 pass
-            self.bekleyen.append("arka_plan_kaydet")
-        komutlar, self.bekleyen = self.bekleyen, []
+            komutlar.append("arka_plan_kaydet")
         return komutlar
 
+
+def arduino_satiri_coz(satir):
+    """Arduino'dan gelen satiri olaya cevirir.
+    Protokol (Arduino -> Pi, satir satir, 9600 baud):
+      HAZIR                      acildi
+      ISINIYOR kalan=45          sensorler isiniyor (sn)
+      OLCUM gaz=412 duman=300    periyodik olcum
+      ALARM gaz=612              esik asildi (ya da: ALARM duman=700)
+      TEMIZ gaz                  deger normale dondu (ya da: TEMIZ duman)
+      SUSTURULDU                 buzzer susturuldu
+    """
+    parcalar = satir.strip().split()
+    if not parcalar:
+        return None
+    komut, degerler = parcalar[0].upper(), {}
+    for parca in parcalar[1:]:
+        if "=" in parca:
+            anahtar, deger = parca.split("=", 1)
+            try:
+                degerler[anahtar.lower()] = int(deger)
+            except ValueError:
+                degerler[anahtar.lower()] = deger
+        else:
+            degerler[parca.lower()] = None
+    if komut == "HAZIR":
+        return {"olay": "arduino_hazir"}
+    if komut == "ISINIYOR":
+        return {"olay": "sensor_isiniyor", **degerler}
+    if komut == "OLCUM":
+        return {"olay": "olcum", **degerler}
+    if komut in ("ALARM", "TEMIZ"):
+        for tur in ("gaz", "duman"):
+            if tur in degerler:
+                sonek = "alarmi" if komut == "ALARM" else "temiz"
+                olay = {"olay": f"{tur}_{sonek}"}
+                if degerler[tur] is not None:
+                    olay["deger"] = degerler[tur]
+                return olay
+    if komut == "SUSTURULDU":
+        return {"olay": "buzzer_susturuldu"}
+    return None
+
+
+class Arduino:
+    """USB seri ile Arduino. Okuma ayri bir is parcaciginda yapilir;
+    kablo cikarilip takilirsa kendiliginden yeniden baglanir."""
+
+    def __init__(self):
+        self.seri = None
+        self.gelen = deque()
+        self.calisiyor = False
+        self.kilit = threading.Lock()
+        try:
+            import serial  # pyserial
+            import serial.tools.list_ports
+        except ImportError:
+            print("[ARDUINO] pyserial kurulu degil; Arduino kapali (pip install pyserial).")
+            return
+        self.serial = serial
+        self.calisiyor = True
+        self.is_parcacigi = threading.Thread(target=self._dongu, daemon=True)
+        self.is_parcacigi.start()
+
+    def _port_bul(self):
+        if ARDUINO_PORT != "otomatik":
+            return ARDUINO_PORT
+        for port in self.serial.tools.list_ports.comports():
+            ad = f"{port.device} {port.description} {port.manufacturer or ''}".lower()
+            if any(k in ad for k in ("ttyacm", "ttyusb", "arduino", "ch340", "usb serial")):
+                return port.device
+        return None
+
+    def _dongu(self):
+        uyarildi = False
+        while self.calisiyor:
+            if self.seri is None:
+                port = self._port_bul()
+                try:
+                    if port is None:
+                        raise OSError("Arduino portu bulunamadi")
+                    seri = self.serial.Serial(port, ARDUINO_HIZ, timeout=1)
+                    with self.kilit:
+                        self.seri = seri
+                    print(f"[ARDUINO] Baglandi: {port}")
+                    uyarildi = False
+                except Exception as hata:
+                    if not uyarildi:
+                        print(f"[ARDUINO] Baglanilamadi ({hata}); 5 sn'de bir denenecek.")
+                        uyarildi = True
+                    time.sleep(5)
+                    continue
+            try:
+                satir = self.seri.readline().decode("ascii", "ignore").strip()
+                if satir:
+                    self.gelen.append(satir)
+            except Exception as hata:
+                if not self.calisiyor:
+                    break
+                print(f"[ARDUINO] Baglanti koptu ({hata}).")
+                with self.kilit:
+                    try:
+                        self.seri.close()
+                    except Exception:
+                        pass
+                    self.seri = None
+                self.gelen.append("KOPTU")
+
+    def gonder(self, komut):
+        with self.kilit:
+            if self.seri is None:
+                return False
+            try:
+                self.seri.write((komut + "\n").encode("ascii"))
+                return True
+            except Exception as hata:
+                print(f"[ARDUINO] Yazilamadi ({hata}).")
+                return False
+
+    def al(self):
+        satirlar = []
+        while self.gelen:
+            satirlar.append(self.gelen.popleft())
+        return satirlar
+
     def kapat(self):
-        if self.istemci is not None:
-            self.istemci.loop_stop()
-            self.istemci.disconnect()
+        self.calisiyor = False
+        if self.seri is not None:
+            try:
+                self.seri.close()
+            except Exception:
+                pass
 
 
 def iskelet_resmi(iz, arka_plan=None):
@@ -640,8 +844,13 @@ def main():
     arka_plan = ArkaPlan(GENISLIK, YUKSEKLIK) if ARKA_PLAN_KULLAN else None
     if arka_plan is not None and arka_plan.resim is None and ACILISTA_KALIBRASYON:
         arka_plan.kalibrasyon_baslat(time.monotonic())
-    komutlar = KomutDinleyici()
+    global MQTT
+    MQTT = MqttBaglanti() if MQTT_KULLAN else None
+    komutlar = KomutDinleyici(MQTT)
+    arduino = Arduino() if ARDUINO_KULLAN else None
     kalibrasyon_iste = False
+    arduinoya_dusme = None  # Arduino'ya en son bildirilen dusme durumu
+    son_ping = 0.0
     secenekler = vision.PoseLandmarkerOptions(
         base_options=mp_python.BaseOptions(model_asset_path=MODEL_DOSYASI),
         running_mode=vision.RunningMode.VIDEO,
@@ -686,10 +895,29 @@ def main():
                 kisiler = kisileri_al(sonuc, GENISLIK, YUKSEKLIK)
                 olaylar = izleyici.guncelle(t, kisiler)
                 for komut in komutlar.al():
+                    print("[KOMUT] Geldi:", komut)
                     if komut == "arka_plan_kaydet":
                         kalibrasyon_iste = True
+                    elif komut == "sustur" and arduino is not None:
+                        arduino.gonder("SUSTUR")
                     else:
                         print("[KOMUT] Bilinmeyen komut:", komut)
+
+                if arduino is not None:
+                    for satir in arduino.al():
+                        if satir == "KOPTU":
+                            olay = {"olay": "arduino_koptu"}
+                            arduinoya_dusme = None
+                        else:
+                            olay = arduino_satiri_coz(satir)
+                            if olay is None:
+                                print("[ARDUINO] Anlasilmayan satir:", satir)
+                                continue
+                            if olay["olay"] == "arduino_hazir":
+                                arduinoya_dusme = None  # durumu yeniden bildir
+                        olay["istasyon"] = ISTASYON_ADI
+                        olay["zaman"] = datetime.now().isoformat(timespec="seconds")
+                        guvenli_gonder(olay)
                 if arka_plan is not None:
                     if kalibrasyon_iste:
                         arka_plan.kalibrasyon_baslat(t)
@@ -720,10 +948,16 @@ def main():
                                 cv2.namedWindow(KANIT_PENCERESI, cv2.WINDOW_NORMAL)
                                 cv2.resizeWindow(KANIT_PENCERESI, 640, 480)
                                 cv2.imshow(KANIT_PENCERESI, resim)
-                    try:
-                        veri_gonder(olay)
-                    except Exception as hata:
-                        print("[HATA] Veri gonderilemedi:", hata)
+                    guvenli_gonder(olay)
+
+                if arduino is not None:
+                    dusme_var = any(iz.durum == "ALARM" for iz in izleyici.izler.values())
+                    if dusme_var != arduinoya_dusme:
+                        if arduino.gonder("DUSME" if dusme_var else "TAMAM"):
+                            arduinoya_dusme = dusme_var
+                    if t - son_ping >= ARDUINO_PING_SN:
+                        arduino.gonder("PING")
+                        son_ping = t
 
                 if goster:
                     tuval = np.zeros((YUKSEKLIK, GENISLIK, 3), dtype=np.uint8)
@@ -754,7 +988,10 @@ def main():
         print("\n[DURDU] Kullanici durdurdu.")
     finally:
         kamera.kapat()
-        komutlar.kapat()
+        if arduino is not None:
+            arduino.kapat()
+        if MQTT is not None:
+            MQTT.kapat()
         if goster:
             cv2.destroyAllWindows()
 
