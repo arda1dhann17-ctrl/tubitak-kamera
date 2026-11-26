@@ -37,12 +37,16 @@ BEKLEME_SANIYESI = 5
 IPTAL_TEYIT_SN = 1.0
 KAYIP_TOLERANS_SN = 2.0
 ALARM_KAYIP_TOLERANS_SN = 30.0
-# Alarm resmi: kamera goruntusu DEGIL, bos zemin uzerine sadece iskelet cizimi.
-# Kamera pikseli, yuz veya video hicbir yere gonderilmez/kaydedilmez.
+# Alarm resmi: arka planda atolye ortami, insanlar YALNIZCA iskelet olarak.
+# Ortam resmi, insan olmayan anlardan ogrenilir (insan bolgeleri hic ogrenilmez),
+# bu yuzden resimde kimsenin yuzu/vucudu gorunmez. Video kaydedilmez.
 ISKELET_RESMI_EKLE = True
 ISKELET_RESMI_OLCEK = 2
 ISKELET_RESMI_KALITE = 70
-ISKELET_ZEMIN_RENGI = (30, 30, 30)
+ISKELET_ZEMIN_RENGI = (60, 60, 60)  # ortami henuz bilinmeyen yerler
+ARKA_PLAN_KULLAN = True
+ARKA_OGRENME_HIZI = 0.02  # 5 FPS'te ~10 sn'de ortam degisikligine uyar
+ARKA_INSAN_PAYI = 0.25    # insan bolgesine eklenen guvenlik payi (boyun orani)
 ISKELET_DOSYAYA_KAYDET = False
 TAKIP_MIN_GORUNURLUK = 0.1
 FPS_RAPOR_SN = 10
@@ -395,11 +399,58 @@ def yazi_yaz(resim, metin, konum, renk, olcek=0.35):
     cv2.putText(resim, metin, konum, FONT, olcek, renk, 1)
 
 
-def iskelet_resmi(iz):
+def insan_maskesi(maske, kisi):
+    noktalar = dict(kisi.tum or kisi.nokta)
+    omuz = ortalama_nokta(noktalar, (SOL_OMUZ, SAG_OMUZ))
+    if BURUN in noktalar and omuz is not None:
+        bx, by = noktalar[BURUN]
+        noktalar["bas_ustu"] = (bx + 0.8 * (bx - omuz[0]), by + 0.8 * (by - omuz[1]))
+    if not noktalar:
+        return
+    pts = np.array(list(noktalar.values()), dtype=np.float32)
+    boyut = max(float(pts[:, 0].max() - pts[:, 0].min()),
+                float(pts[:, 1].max() - pts[:, 1].min()), 1.0)
+    pay = max(8, int(ARKA_INSAN_PAYI * boyut))
+    kabuk = cv2.convexHull(pts).astype(np.int32)
+    cv2.fillConvexPoly(maske, kabuk, 255)
+    cv2.polylines(maske, [kabuk], True, 255, 2 * pay + 1)
+    for x, y in pts.astype(np.int32):
+        cv2.circle(maske, (int(x), int(y)), pay, 255, -1)
+
+
+class ArkaPlan:
+    """Atolyenin insansiz halini ogrenir. Insan olan pikseller hic guncellenmez."""
+
+    def __init__(self, genislik, yukseklik):
+        self.resim = np.zeros((yukseklik, genislik, 3), dtype=np.float32)
+        self.bilinen = np.zeros((yukseklik, genislik), dtype=np.uint8)
+        self.maske = np.zeros((yukseklik, genislik), dtype=np.uint8)
+
+    def guncelle(self, kare, kisiler):
+        self.maske[:] = 0
+        for kisi in kisiler:
+            insan_maskesi(self.maske, kisi)
+        bos = cv2.bitwise_not(self.maske)
+        yeni = cv2.bitwise_and(bos, cv2.bitwise_not(self.bilinen))
+        np.copyto(self.resim, kare.astype(np.float32), where=(yeni > 0)[..., None])
+        eski = cv2.bitwise_and(bos, self.bilinen)
+        cv2.accumulateWeighted(kare, self.resim, ARKA_OGRENME_HIZI, mask=eski)
+        cv2.bitwise_or(self.bilinen, bos, dst=self.bilinen)
+
+    def goruntu(self):
+        resim = self.resim.astype(np.uint8)
+        resim[self.bilinen == 0] = ISKELET_ZEMIN_RENGI
+        return resim
+
+
+def iskelet_resmi(iz, arka_plan=None):
     kisiler, sira = iz.goruntu
     k = ISKELET_RESMI_OLCEK
     w, h = GENISLIK * k, YUKSEKLIK * k
-    resim = np.full((h, w, 3), ISKELET_ZEMIN_RENGI, dtype=np.uint8)
+    if arka_plan is not None:
+        resim = cv2.resize(arka_plan.goruntu(), (w, h), interpolation=cv2.INTER_LINEAR)
+    else:
+        resim = np.full((h, w, 3), ISKELET_ZEMIN_RENGI, dtype=np.uint8)
 
     def olcekle(noktalar):
         return {i: (p[0] * k, p[1] * k) for i, p in noktalar.items()}
@@ -494,6 +545,7 @@ def main():
         sys.exit(1)
 
     izleyici = Izleyici()
+    arka_plan = ArkaPlan(GENISLIK, YUKSEKLIK) if ARKA_PLAN_KULLAN else None
     secenekler = vision.PoseLandmarkerOptions(
         base_options=mp_python.BaseOptions(model_asset_path=MODEL_DOSYASI),
         running_mode=vision.RunningMode.VIDEO,
@@ -537,6 +589,8 @@ def main():
                 t = time.monotonic()
                 kisiler = kisileri_al(sonuc, GENISLIK, YUKSEKLIK)
                 olaylar = izleyici.guncelle(t, kisiler)
+                if arka_plan is not None:
+                    arka_plan.guncelle(kare, kisiler)
 
                 for iz in izleyici.izler.values():
                     if iz.durum != iz.yazilan_durum:
@@ -546,7 +600,7 @@ def main():
                 for iz, olay in olaylar:
                     olay["gorunen_kisi_sayisi"] = len(kisiler)
                     if olay["olay"] == "yerde_hareketsiz" and ISKELET_RESMI_EKLE:
-                        resim, jpeg = iskelet_resmi(iz)
+                        resim, jpeg = iskelet_resmi(iz, arka_plan)
                         if jpeg is not None:
                             olay["iskelet_jpg_base64"] = base64.b64encode(jpeg).decode("ascii")
                             if ISKELET_DOSYAYA_KAYDET:
