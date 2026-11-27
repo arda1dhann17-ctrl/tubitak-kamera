@@ -1,5 +1,17 @@
 #!/usr/bin/env python3
 
+# =====================================================================
+#  RASPBERRY PI KODU - Kamera ile dusme algilama
+#  Akilli Acil Durum Istasyonu (TUBITAK 4006-A)
+#
+#  Ne yapar: Kameradan iskelet cikarir (MediaPipe), dusmeyi ve gorus
+#  disina dusmeyi algilar, alarm resmini (atolye + iskelet) MQTT ile
+#  uygulamaya yollar, Arduino'ya seri porttan haber verir.
+#  Nerede calisir: Raspberry Pi 3 (ya da deneme icin bilgisayar).
+#  Calistirma: python3 kamera_dusme_algilama.py
+#  Arduino tarafi: arduino/sensor_ve_alarm/sensor_ve_alarm.ino
+# =====================================================================
+
 import base64
 import json
 import math

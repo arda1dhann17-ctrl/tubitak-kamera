@@ -1,4 +1,9 @@
-// Akilli Acil Durum Istasyonu - Arduino tarafi
+// =====================================================================
+//  ARDUINO KODU - Gaz/duman sensoru, buzzer, RGB isik, acil buton
+//  Akilli Acil Durum Istasyonu (TUBITAK 4006-A)
+//  Nereye yuklenir: Arduino Uno / Nano (Arduino IDE ile)
+//  Raspberry Pi tarafi: raspberry_pi/kamera_dusme_algilama.py
+// =====================================================================
 // Gorevi: gaz ve duman sensorlerini okumak, tehlikede buzzer ve RGB isikla
 // uyarmak, Raspberry Pi'ye USB seri uzerinden bilgi vermek ve Pi'den gelen
 // "DUSME" komutunda uyari vermek.

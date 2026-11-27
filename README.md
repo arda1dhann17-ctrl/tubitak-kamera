@@ -2,8 +2,16 @@
 
 Atölyeler için düşme, gaz ve duman uyarı sistemi. Raspberry Pi 3 kamerayla düşmeyi algılar. Arduino gaz ve duman sensörlerini okur, buzzer ve RGB ışıkla uyarır. Bildirimler MQTT ile mobil uygulamaya gider.
 
+## Dosyalar
+
+| Dosya | Ne için | Nereye |
+| --- | --- | --- |
+| `raspberry_pi/kamera_dusme_algilama.py` | Kamera, düşme algılama, MQTT, Arduino ile haberleşme | Raspberry Pi'ye (ya da deneme için PC'ye) |
+| `raspberry_pi/kamera_dusme_algilama.pyproj` | Visual Studio proje dosyası | Visual Studio kullanıyorsanız |
+| `arduino/sensor_ve_alarm/sensor_ve_alarm.ino` | Gaz/duman sensörü, buzzer, RGB ışık, acil buton | Arduino'ya (Arduino IDE ile) |
+
 ```
-Kamera ──> Raspberry Pi (PythonApplication1.py) ──USB seri──> Arduino (sensörler, buzzer, RGB)
+Kamera ──> Raspberry Pi (kamera_dusme_algilama.py) ──USB seri──> Arduino (sensörler, buzzer, RGB)
                     │
                     └── MQTT (Mosquitto, Pi'nin üzerinde) ──Wi-Fi──> Mobil uygulama
 ```
@@ -24,7 +32,7 @@ allow_anonymous true
 
 > Not: Bu ayar okul ağı içinde deneme içindir. Kalıcı kullanımda kullanıcı adı ve şifre eklenmeli.
 
-Çalıştırma: `python3 PythonApplication1.py`
+Çalıştırma: `python3 raspberry_pi/kamera_dusme_algilama.py`
 
 İlk açılışta **5 dakika kalibrasyon** yapılır. Bu sürede oda boş bırakılır ve atölyenin boş hali `arka_plan.png` olarak kaydedilir.
 
@@ -69,7 +77,7 @@ mosquitto_pub -h <pi-ip> -t atolye/atolye-1/komut -m sustur
 
 ## Arduino
 
-Kod `arduino/acil_durum_istasyonu/acil_durum_istasyonu.ino` dosyasında. Arduino IDE ile Uno ya da Nano'ya yüklenir. USB kablosuyla Pi'ye takılır. Port otomatik bulunur, gerekirse `ARDUINO_PORT` ayarından elle girilir.
+Kod `arduino/sensor_ve_alarm/sensor_ve_alarm.ino` dosyasında. Arduino IDE ile Uno ya da Nano'ya yüklenir. USB kablosuyla Pi'ye takılır. Port otomatik bulunur, gerekirse `ARDUINO_PORT` ayarından elle girilir.
 
 | Parça | Arduino pini |
 | --- | --- |
