@@ -41,8 +41,14 @@ ALARM_KAYIP_TOLERANS_SN = 30.0
 # Alarm resmi: arka planda atolye ortami, insanlar YALNIZCA iskelet olarak.
 # Ortam resmi bir kez "kalibrasyon" ile kaydedilir: oda bosken birkac dakika
 # boyunca, icinde hic insan bulunmayan kareler toplanip medyanlari alinir.
-# Sonra resim sabit kalir (surekli ogrenme yok), boyle insanlar ona karisamaz.
-# Ortam degisirse yeniden kalibrasyon baslatilir (pencerede "k" tusu,
+# Sonra resim CANLI guncellenir, ama sadece guvenli piksellerde:
+#  - Insan bolgesi (iskelet + guvenlik payi) hic guncellenmez. Bir insanin
+#    goruldugu yer "kilitlenir"; kilit, o piksel tekrar eski ortam rengine
+#    donunce (kisi gercekten gidince) acilir. Model kisiyi sonradan kaybetse de
+#    (yarim gorunme, hareketsiz yatma) o bolge kilitli kaldigi icin karismaz.
+#  - Bir degisiklik (tasinan dolap, isik) ancak ARKA_SABIT_SN boyunca hic
+#    kipirdamadan durursa ortama islenir. Yuruyen biri hic islenmez.
+# Istenirse yeniden kalibrasyon da baslatilabilir (pencerede "k" tusu,
 # klasore "arka_plan_kaydet" adli bos dosya koymak veya MQTT "arka_plan_kaydet").
 ISKELET_RESMI_EKLE = True
 ISKELET_RESMI_OLCEK = 2
@@ -56,6 +62,13 @@ KALIBRASYON_SN = 300          # 5 dakika; bu surede oda bos birakilmali
 KALIBRASYON_ORNEK_ARALIGI = 3.0  # kac saniyede bir ornek kare alinsin
 KALIBRASYON_MIN_ORNEK = 20    # bu kadar insansiz kare toplanmadan bitmez
 KALIBRASYON_TETIK_DOSYASI = "arka_plan_kaydet"
+ARKA_CANLI_GUNCELLE = True
+ARKA_SABIT_SN = 60           # degisiklik bu kadar sabit kalirsa ortama islenir
+ARKA_HAREKET_ESIGI = 18      # kareler arasi renk farki (0-255) bundan buyukse "hareket"
+ARKA_KILIT_ACMA_ESIGI = 20   # piksel eski ortama bu kadar yakinsa kilit acilir
+ARKA_OGRENME_HIZI = 0.05     # sabit bolgeler ortama ne hizla islensin
+ARKA_INSAN_PAYI = 0.25       # insan bolgesine eklenen pay (vucut boyunun orani)
+ARKA_KAYDET_SN = 600         # canli guncellenen ortam 10 dk'da bir diske yazilir
 
 # --- MQTT: broker (Mosquitto) Pi'nin kendisinde calisir, uygulama ona baglanir ---
 #   atolye/<istasyon>/dusme  : yerde_hareketsiz (iskelet resmiyle), kisi_kalkti
@@ -442,8 +455,28 @@ def yazi_yaz(resim, metin, konum, renk, olcek=0.35):
     cv2.putText(resim, metin, konum, FONT, olcek, renk, 1)
 
 
+def insan_maskesi(maske, kisi):
+    noktalar = dict(kisi.tum or kisi.nokta)
+    omuz = ortalama_nokta(noktalar, (SOL_OMUZ, SAG_OMUZ))
+    if BURUN in noktalar and omuz is not None:
+        bx, by = noktalar[BURUN]
+        noktalar["bas_ustu"] = (bx + 0.8 * (bx - omuz[0]), by + 0.8 * (by - omuz[1]))
+    if not noktalar:
+        return
+    pts = np.array(list(noktalar.values()), dtype=np.float32)
+    boyut = max(float(pts[:, 0].max() - pts[:, 0].min()),
+                float(pts[:, 1].max() - pts[:, 1].min()), 1.0)
+    pay = max(8, int(ARKA_INSAN_PAYI * boyut))
+    kabuk = cv2.convexHull(pts).astype(np.int32)
+    cv2.fillConvexPoly(maske, kabuk, 255)
+    cv2.polylines(maske, [kabuk], True, 255, 2 * pay + 1)
+    for x, y in pts.astype(np.int32):
+        cv2.circle(maske, (int(x), int(y)), pay, 255, -1)
+
+
 class ArkaPlan:
-    """Atolyenin bos halini kalibrasyonla kaydeder; sonra sabit kalir."""
+    """Atolyenin bos halini kalibrasyonla kaydeder, sonra insan olmayan ve
+    uzun sure sabit kalan piksellerde canli gunceller."""
 
     def __init__(self, genislik, yukseklik):
         self.boyut = (yukseklik, genislik)
@@ -452,11 +485,25 @@ class ArkaPlan:
         self.kalib_basi = None
         self.son_ornek = None
         self.uyarildi = False
+        self._canli_sifirla()
         if os.path.exists(ARKA_PLAN_DOSYASI):
             resim = cv2.imread(ARKA_PLAN_DOSYASI)
             if resim is not None and resim.shape[:2] == self.boyut:
-                self.resim = resim
+                self._resim_ata(resim)
                 print("[ARKA PLAN] Kayitli atolye resmi yuklendi:", ARKA_PLAN_DOSYASI)
+
+    def _canli_sifirla(self):
+        h, w = self.boyut
+        self.onceki = None
+        self.son_hareket = np.zeros((h, w), dtype=np.float32)
+        self.kilit = np.zeros((h, w), dtype=np.uint8)
+        self.maske = np.zeros((h, w), dtype=np.uint8)
+        self.resim_f = None
+        self.son_kayit = None
+
+    def _resim_ata(self, resim):
+        self.resim = resim
+        self.resim_f = resim.astype(np.float32)
 
     @property
     def kalibre_ediliyor(self):
@@ -476,6 +523,8 @@ class ArkaPlan:
     def guncelle(self, t, kare, kisiler):
         """Kalibrasyon bittiyse olay adi dondurur, yoksa None."""
         if not self.kalibre_ediliyor:
+            if self.resim is not None and ARKA_CANLI_GUNCELLE:
+                self._canli_guncelle(t, kare, kisiler)
             return None
         bos_oda = not kisiler
         if bos_oda and (self.son_ornek is None
@@ -492,15 +541,56 @@ class ArkaPlan:
                 self.uyarildi = True
             return None
         # Medyan: ornek karelerin birinde kisa sureligine gorunen biri olsa bile silinir.
-        self.resim = np.median(np.stack(self.ornekler), axis=0).astype(np.uint8)
+        resim = np.median(np.stack(self.ornekler), axis=0).astype(np.uint8)
         self.ornekler = []
         self.kalib_basi = None
+        self._canli_sifirla()
+        self._resim_ata(resim)
+        self.son_kayit = t
+        self._kaydet()
+        print("[ARKA PLAN] Kalibrasyon bitti, kaydedildi:", ARKA_PLAN_DOSYASI)
+        return "arka_plan_kaydedildi"
+
+    def _kaydet(self):
         try:
             cv2.imwrite(ARKA_PLAN_DOSYASI, self.resim)
-            print("[ARKA PLAN] Kalibrasyon bitti, kaydedildi:", ARKA_PLAN_DOSYASI)
         except Exception as hata:
             print("[HATA] Arka plan kaydedilemedi:", hata)
-        return "arka_plan_kaydedildi"
+
+    def _canli_guncelle(self, t, kare, kisiler):
+        # 1) Bu karedeki insan bolgeleri -> kilitle.
+        self.maske[:] = 0
+        for kisi in kisiler:
+            insan_maskesi(self.maske, kisi)
+        cv2.bitwise_or(self.kilit, self.maske, dst=self.kilit)
+
+        # 2) Hareket: onceki kareye gore belirgin degisen pikseller.
+        if self.onceki is None:
+            self.onceki = kare.copy()
+            self.son_hareket[:] = t
+            if self.son_kayit is None:
+                self.son_kayit = t
+            return
+        hareket = cv2.absdiff(kare, self.onceki).max(axis=2) > ARKA_HAREKET_ESIGI
+        self.son_hareket[hareket] = t
+        self.onceki[:] = kare
+
+        # 3) Kilit acma: piksel eski ortamla ayniysa kisi gitmistir.
+        ortama_yakin = (cv2.absdiff(kare, self.resim).max(axis=2)
+                        <= ARKA_KILIT_ACMA_ESIGI)
+        acilacak = ortama_yakin & (self.kilit > 0) & (self.maske == 0)
+        self.kilit[acilacak] = 0
+
+        # 4) Sadece kilitsiz, insan olmayan ve uzun suredir sabit pikseller ogrenilir.
+        sabit = (t - self.son_hareket) >= ARKA_SABIT_SN
+        ogren = (sabit & (self.kilit == 0)).astype(np.uint8) * 255
+        if cv2.countNonZero(ogren):
+            cv2.accumulateWeighted(kare, self.resim_f, ARKA_OGRENME_HIZI, mask=ogren)
+            self.resim = self.resim_f.astype(np.uint8)
+
+        if t - self.son_kayit >= ARKA_KAYDET_SN:
+            self.son_kayit = t
+            self._kaydet()
 
     def goruntu(self):
         if self.resim is None:

@@ -26,7 +26,15 @@ allow_anonymous true
 
 Çalıştırma: `python3 PythonApplication1.py`
 
-İlk açılışta **5 dakika kalibrasyon** yapılır. Bu sürede oda boş bırakılır ve atölyenin boş hali `arka_plan.png` olarak kaydedilir. Ortam değişirse yeniden kalibrasyon şu üç yoldan biriyle başlatılır:
+İlk açılışta **5 dakika kalibrasyon** yapılır. Bu sürede oda boş bırakılır ve atölyenin boş hali `arka_plan.png` olarak kaydedilir.
+
+Kalibrasyondan sonra ortam resmi **canlı güncellenir**, ama yalnızca güvenli piksellerde:
+
+- İnsan görülen bölge (iskelet ve çevresindeki pay) kilitlenir, hiç güncellenmez. Kilit, o bölge tekrar eski haline dönünce (kişi gidince) açılır. Model kişiyi sonradan kaybetse bile (yarım görünme, hareketsiz yatma) bölge kilitli kalır.
+- Bir değişiklik (taşınan dolap, ışık) ancak 60 sn (`ARKA_SABIT_SN`) hiç kıpırdamadan durursa ortama işlenir. Yürüyen biri hiç işlenmez.
+- Güncel ortam 10 dakikada bir `arka_plan.png` dosyasına yazılır.
+
+İstenirse yeniden kalibrasyon şu üç yoldan biriyle başlatılır (örneğin kilitli kalan bir bölgede eşya yer değiştirdiyse):
 
 - Pencerede `k` tuşuna basmak
 - Program klasörüne `arka_plan_kaydet` adlı boş bir dosya koymak
