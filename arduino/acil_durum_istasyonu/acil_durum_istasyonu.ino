@@ -4,12 +4,16 @@
 // "DUSME" komutunda uyari vermek.
 //
 // Seri protokol (9600 baud, her mesaj bir satir):
-//   Pi -> Arduino : DUSME | TAMAM | SUSTUR | PING
+//   Pi -> Arduino : DUSME | TAMAM | SUSTUR | SIFIRLA | PING
 //   Arduino -> Pi : HAZIR | ISINIYOR kalan=45 | OLCUM gaz=412 duman=300
 //                   ALARM gaz=612 | ALARM duman=700 | TEMIZ gaz | TEMIZ duman
-//                   SUSTURULDU
+//                   SUSTURULDU | ACIL | ACIL_IPTAL
+//
+// Acil durum butonu: kisa basis = ACIL (yardim cagir), 3 sn basili tutmak =
+// ACIL_IPTAL. Kamera kisiyi goremese bile (masa arkasi vb.) yardim cagrilabilir.
 //
 // Isik renkleri (oncelik sirasiyla):
+//   acil buton : kirmizi, hizli yanip soner + hizli bip
 //   duman  : mor, hizli yanip soner + hizli bip
 //   gaz    : turuncu, hizli yanip soner + hizli bip
 //   dusme  : kirmizi, yavas yanip soner + kesik bip
@@ -24,6 +28,8 @@ const int BUZZER_PIN = 8;
 const int KIRMIZI_PIN = 9;     // RGB LED (PWM pinleri)
 const int YESIL_PIN = 10;
 const int MAVI_PIN = 11;
+const int BUTON_PIN = 2;       // acil durum butonu: bir ucu D2, diger ucu GND
+const unsigned long BUTON_IPTAL_MS = 3000UL;
 
 const bool ORTAK_ANOT_LED = false;  // ortak anotlu RGB LED ise true yapin
 const bool AKTIF_BUZZER = true;     // pasif (ton isteyen) buzzer ise false yapin
@@ -54,6 +60,10 @@ int dumanSayac = 0;
 bool gazAlarm = false;
 bool dumanAlarm = false;
 bool dusmeAlarm = false;
+bool acilAlarm = false;
+bool butonOnceki = false;
+unsigned long butonBasma = 0;
+bool butonIptalGonderildi = false;
 
 unsigned long sonOkuma = 0;
 unsigned long sonOlcumGonderme = 0;
@@ -131,6 +141,9 @@ void komutIsle(const char *komut, unsigned long simdi) {
     dusmeAlarm = true;
   } else if (strcmp(komut, "TAMAM") == 0) {
     dusmeAlarm = false;
+  } else if (strcmp(komut, "SIFIRLA") == 0) {
+    dusmeAlarm = false;
+    acilAlarm = false;
   } else if (strcmp(komut, "SUSTUR") == 0) {
     susturuldu = true;
     susturmaBitis = simdi + SUSTURMA_MS;
@@ -154,13 +167,38 @@ void seriOku(unsigned long simdi) {
   }
 }
 
+void butonOku(unsigned long simdi) {
+  bool basili = digitalRead(BUTON_PIN) == LOW;  // INPUT_PULLUP: basinca LOW
+  if (basili && !butonOnceki) {
+    butonBasma = simdi;
+    butonIptalGonderildi = false;
+  }
+  if (basili && !butonIptalGonderildi && simdi - butonBasma >= BUTON_IPTAL_MS) {
+    butonIptalGonderildi = true;
+    if (acilAlarm) {
+      acilAlarm = false;
+      Serial.println("ACIL_IPTAL");
+    }
+  }
+  if (!basili && butonOnceki && !butonIptalGonderildi && simdi - butonBasma >= 50) {
+    if (!acilAlarm) susturmayiKaldir();
+    acilAlarm = true;
+    Serial.println("ACIL");
+  }
+  butonOnceki = basili;
+}
+
 void cikislariGuncelle(unsigned long simdi) {
   bool isiniyor = simdi < ISINMA_MS;
   bool piYok = !piHicKonusmadi && (simdi - sonPiMesaji > PI_ZAMAN_ASIMI_MS);
   if (susturuldu && (long)(simdi - susturmaBitis) >= 0) susturuldu = false;
 
   bool sesli = false;
-  if (dumanAlarm) {
+  if (acilAlarm) {
+    bool a = yanipSon(simdi, 150);
+    a ? renkYaz(255, 0, 0) : renkYaz(0, 0, 0);
+    sesli = a;
+  } else if (dumanAlarm) {
     bool a = yanipSon(simdi, 150);
     a ? renkYaz(160, 0, 255) : renkYaz(0, 0, 0);
     sesli = a;
@@ -188,6 +226,7 @@ void setup() {
   pinMode(KIRMIZI_PIN, OUTPUT);
   pinMode(YESIL_PIN, OUTPUT);
   pinMode(MAVI_PIN, OUTPUT);
+  pinMode(BUTON_PIN, INPUT_PULLUP);
   buzzerYaz(false);
   renkYaz(0, 0, 255);
   Serial.begin(9600);
@@ -197,6 +236,7 @@ void setup() {
 void loop() {
   unsigned long simdi = millis();
   seriOku(simdi);
+  butonOku(simdi);
 
   if (simdi - sonOkuma >= OKUMA_ARALIGI_MS) {
     sonOkuma = simdi;

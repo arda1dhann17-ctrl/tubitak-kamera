@@ -37,7 +37,18 @@ HAREKET_ESIGI = 0.04
 BEKLEME_SANIYESI = 5
 IPTAL_TEYIT_SN = 1.0
 KAYIP_TOLERANS_SN = 2.0
-ALARM_KAYIP_TOLERANS_SN = 30.0
+ALARM_KAYIP_TOLERANS_SN = 300.0  # alarmdaki kisi gorunmese de alarm 5 dk surer
+# --- Gorus disina dusme (masa/tezgah arkasi) ---
+# Kisi ani bir dusus yapip ya da yatarken gorus alanindan kaybolursa (veya sadece
+# ust govdesi gorunup durusu olculemezse) ve GIZLI_BEKLEME_SN boyunca tekrar
+# ayakta gorunmezse "gorus_disi_dusme" alarmi verilir. Cerceve kenarindan
+# cikan kisi icin alarm verilmez (odadan cikmistir).
+ANI_DUSUS_SN = 1.0         # bu sure icinde...
+ANI_DUSUS_ORANI = 0.5      # ...ust govde, boyunun bu orani kadar asagi inerse "ani dusus"
+GIZLI_PENCERE_SN = 3.0     # ani dusus ile kaybolma arasindaki en fazla sure
+GIZLI_BEKLEME_SN = 10.0    # bu kadar gorunmezse alarm
+UST_DIK_ACISI = 40         # bas-omuz cizgisi dikeye bu acidan yakinsa "dik oturuyor"
+KENAR_PAYI = 0.08          # cerceve kenarina bu oranda yakin kaybolan kisi cikmis sayilir
 # Alarm resmi: arka planda atolye ortami, insanlar YALNIZCA iskelet olarak.
 # Ortam resmi bir kez "kalibrasyon" ile kaydedilir: oda bosken birkac dakika
 # boyunca, icinde hic insan bulunmayan kareler toplanip medyanlari alinir.
@@ -69,6 +80,7 @@ ARKA_KILIT_ACMA_ESIGI = 20   # piksel eski ortama bu kadar yakinsa kilit acilir
 ARKA_OGRENME_HIZI = 0.05     # sabit bolgeler ortama ne hizla islensin
 ARKA_INSAN_PAYI = 0.25       # insan bolgesine eklenen pay (vucut boyunun orani)
 ARKA_KAYDET_SN = 600         # canli guncellenen ortam 10 dk'da bir diske yazilir
+ARKA_GUNCELLEME_SN = 1.0     # canli guncelleme saniyede 1 kez (Pi 3'u yormamak icin)
 
 # --- MQTT: broker (Mosquitto) Pi'nin kendisinde calisir, uygulama ona baglanir ---
 #   atolye/<istasyon>/dusme  : yerde_hareketsiz (iskelet resmiyle), kisi_kalkti
@@ -93,7 +105,8 @@ FPS_RAPOR_SN = 10
 
 
 OLAY_KONULARI = {
-    "yerde_hareketsiz": "dusme", "kisi_kalkti": "dusme",
+    "yerde_hareketsiz": "dusme", "kisi_kalkti": "dusme", "gorus_disi_dusme": "dusme",
+    "acil_buton": "dusme", "acil_buton_iptal": "dusme", "alarm_kapatildi": "dusme",
     "gaz_alarmi": "gaz", "duman_alarmi": "gaz", "gaz_temiz": "gaz", "duman_temiz": "gaz",
     "olcum": "olcum",
 }
@@ -238,6 +251,18 @@ def durus_olc(noktalar):
     return aci, en_boy, boyut
 
 
+def ust_govde_dik(noktalar):
+    """Bas omuzlarin ustunde ve govde dik mi? (kalca gorunmese de)"""
+    omuz = ortalama_nokta(noktalar, (SOL_OMUZ, SAG_OMUZ))
+    if omuz is None or BURUN not in noktalar:
+        return False
+    bx, by = noktalar[BURUN]
+    yukari = omuz[1] - by
+    if yukari <= 0:
+        return False
+    return math.degrees(math.atan2(abs(bx - omuz[0]), yukari)) < UST_DIK_ACISI
+
+
 class HareketOlcer:
 
     def __init__(self, pencere_sn):
@@ -310,15 +335,78 @@ class DusmeTakipcisi:
         self.bilgi = {"aci": None, "en_boy": None, "hareket": None,
                       "yatiyor": None, "gecen": None}
         self.yazilan_durum = "NORMAL"
+        self.ust_gecmis = deque()   # (t, ust govde y, boyut)
+        self.son_ani_dusus = None
+        self.son_yatiyor = False
+        self.gizli_basi = None
+        self.alarm_turu = None
 
     def sifirla(self):
         self.durum = "NORMAL"
         self.sayac_basi = None
         self.iptal_basi = None
+        self.gizli_basi = None
+        self.alarm_turu = None
 
     def kayip_mi(self, t):
-        tolerans = ALARM_KAYIP_TOLERANS_SN if self.durum == "ALARM" else KAYIP_TOLERANS_SN
+        if self.durum == "ALARM":
+            tolerans = ALARM_KAYIP_TOLERANS_SN
+        elif self.gizli_basi is not None:
+            tolerans = GIZLI_BEKLEME_SN + 5.0
+        else:
+            tolerans = KAYIP_TOLERANS_SN
         return self.son_gorulen is None or (t - self.son_gorulen) > tolerans
+
+    def _dusus_izle(self, t, noktalar, boyut):
+        ust = ortalama_nokta(noktalar, (SOL_OMUZ, SAG_OMUZ))
+        if ust is None and BURUN in noktalar:
+            ust = noktalar[BURUN]
+        if ust is None:
+            return
+        self.ust_gecmis.append((t, ust[1], boyut))
+        while self.ust_gecmis and t - self.ust_gecmis[0][0] > ANI_DUSUS_SN:
+            self.ust_gecmis.popleft()
+        en_ust = min(y for _, y, _ in self.ust_gecmis)
+        ref = max(b for _, _, b in self.ust_gecmis)
+        if (ust[1] - en_ust) / max(ref, 1.0) >= ANI_DUSUS_ORANI:
+            if self.son_ani_dusus is None or t - self.son_ani_dusus > ANI_DUSUS_SN:
+                print(f"[DUSUS] #{self.kimlik}: ani dusus algilandi")
+            self.son_ani_dusus = t
+
+    def _kenarda(self):
+        if self.merkez is None:
+            return False
+        x, y = self.merkez
+        px, py = KENAR_PAYI * GENISLIK, KENAR_PAYI * YUKSEKLIK
+        return x < px or x > GENISLIK - px or y < py or y > YUKSEKLIK - py
+
+    def _olculemiyor(self, t, noktalar=None):
+        """Kisi gorunmuyor ya da durusu olculemiyor (or. masa arkasinda)."""
+        if self.durum == "ALARM":
+            return None
+        if noktalar is not None and ust_govde_dik(noktalar):
+            # Sadece ust govde gorunuyor ama dik (masada oturuyor): supheli degil.
+            if self.gizli_basi is not None:
+                print(f"[DUSUS] #{self.kimlik}: ust govde dik goruldu, iptal")
+            self.gizli_basi = None
+            self.son_ani_dusus = None
+            return None
+        if self.gizli_basi is None:
+            yeni_dusus = (self.son_ani_dusus is not None
+                          and t - self.son_ani_dusus <= GIZLI_PENCERE_SN)
+            supheli = yeni_dusus or self.durum == "SAYIYOR" or self.son_yatiyor
+            if supheli and not self._kenarda():
+                self.gizli_basi = t
+                print(f"[DUSUS] #{self.kimlik}: gorus disinda kaldi, "
+                      f"{GIZLI_BEKLEME_SN:.0f} sn bekleniyor")
+            return None
+        if t - self.gizli_basi >= GIZLI_BEKLEME_SN:
+            self.durum = "ALARM"
+            self.alarm_turu = "gorus_disi_dusme"
+            self.sayac_basi = self.gizli_basi
+            self.iptal_basi = None
+            return self.olay_olustur("gorus_disi_dusme", t)
+        return None
 
     def olay_olustur(self, tur, t):
         return {
@@ -337,15 +425,24 @@ class DusmeTakipcisi:
         if noktalar is None:
             if self.kayip_mi(t):
                 self.sifirla()
+                return self.durum, olay, bilgi
+            olay = self._olculemiyor(t)
             return self.durum, olay, bilgi
         self.son_gorulen = t
+        if self.boyut is not None:
+            self._dusus_izle(t, noktalar, self.boyut)
 
         olcum = durus_olc(noktalar)
         if olcum is None:
+            olay = self._olculemiyor(t, noktalar)
             return self.durum, olay, bilgi
         aci, en_boy, boyut = olcum
 
         yatiyor = (aci >= YATIS_ACISI) and (en_boy >= YATIS_EN_BOY)
+        self.son_yatiyor = yatiyor
+        if self.gizli_basi is not None and self.durum != "ALARM":
+            print(f"[DUSUS] #{self.kimlik}: tekrar gorundu")
+            self.gizli_basi = None
         hareket = self.olcer.olc(t, noktalar, boyut)
         hareketsiz = (hareket is None) or (hareket < HAREKET_ESIGI)
 
@@ -362,6 +459,7 @@ class DusmeTakipcisi:
                 self.iptal_basi = None
                 if t - self.sayac_basi >= BEKLEME_SANIYESI:
                     self.durum = "ALARM"
+                    self.alarm_turu = "yerde_hareketsiz"
                     olay = self.olay_olustur("yerde_hareketsiz", t)
             else:
                 if self.iptal_basi is None:
@@ -439,6 +537,13 @@ class Izleyici:
                 del self.izler[kimlik]
         return olaylar
 
+    def alarmlari_kapat(self):
+        for iz in self.izler.values():
+            if iz.durum != "NORMAL":
+                iz.sifirla()
+                iz.son_yatiyor = False
+                iz.son_ani_dusus = None
+
     def en_kritik(self):
         oncelik = {"ALARM": 2, "SAYIYOR": 1, "NORMAL": 0}
         en_iyi, en_puan = None, None
@@ -500,6 +605,7 @@ class ArkaPlan:
         self.maske = np.zeros((h, w), dtype=np.uint8)
         self.resim_f = None
         self.son_kayit = None
+        self.son_canli = None
 
     def _resim_ata(self, resim):
         self.resim = resim
@@ -523,7 +629,9 @@ class ArkaPlan:
     def guncelle(self, t, kare, kisiler):
         """Kalibrasyon bittiyse olay adi dondurur, yoksa None."""
         if not self.kalibre_ediliyor:
-            if self.resim is not None and ARKA_CANLI_GUNCELLE:
+            if (self.resim is not None and ARKA_CANLI_GUNCELLE
+                    and (self.son_canli is None or t - self.son_canli >= ARKA_GUNCELLEME_SN)):
+                self.son_canli = t
                 self._canli_guncelle(t, kare, kisiler)
             return None
         bos_oda = not kisiler
@@ -706,6 +814,7 @@ def arduino_satiri_coz(satir):
       ALARM gaz=612              esik asildi (ya da: ALARM duman=700)
       TEMIZ gaz                  deger normale dondu (ya da: TEMIZ duman)
       SUSTURULDU                 buzzer susturuldu
+      ACIL / ACIL_IPTAL          acil durum butonuna basildi / iptal edildi
     """
     parcalar = satir.strip().split()
     if not parcalar:
@@ -736,6 +845,10 @@ def arduino_satiri_coz(satir):
                 return olay
     if komut == "SUSTURULDU":
         return {"olay": "buzzer_susturuldu"}
+    if komut == "ACIL":
+        return {"olay": "acil_buton"}
+    if komut == "ACIL_IPTAL":
+        return {"olay": "acil_buton_iptal"}
     return None
 
 
@@ -900,7 +1013,14 @@ def bilgi_yaz(tuval, izleyici, t, kisi_sayisi):
         durum = "SAYIYOR"
         metin = f"SAYIYOR #{iz.kimlik}  {t - iz.sayac_basi:.1f}/{BEKLEME_SANIYESI} sn"
     else:
-        durum, metin = "NORMAL", "NORMAL"
+        gizli = [iz for iz in izler if iz.gizli_basi is not None]
+        if gizli:
+            iz = gizli[0]
+            durum = "SAYIYOR"
+            metin = (f"GORUS DISI #{iz.kimlik}  "
+                     f"{t - iz.gizli_basi:.0f}/{GIZLI_BEKLEME_SN:.0f} sn")
+        else:
+            durum, metin = "NORMAL", "NORMAL"
     cv2.putText(tuval, metin, (6, 20), FONT, 0.6, DURUM_RENKLERI[durum], 2)
 
     satir = f"kisi:{kisi_sayisi}"
@@ -990,6 +1110,13 @@ def main():
                         kalibrasyon_iste = True
                     elif komut == "sustur" and arduino is not None:
                         arduino.gonder("SUSTUR")
+                    elif komut == "alarm_kapat":
+                        # Uygulamadan "yardim geldi / alarmi kapat"
+                        izleyici.alarmlari_kapat()
+                        if arduino is not None:
+                            arduino.gonder("SIFIRLA")
+                        guvenli_gonder({"istasyon": ISTASYON_ADI, "olay": "alarm_kapatildi",
+                                        "zaman": datetime.now().isoformat(timespec="seconds")})
                     else:
                         print("[KOMUT] Bilinmeyen komut:", komut)
 
@@ -1027,7 +1154,8 @@ def main():
 
                 for iz, olay in olaylar:
                     olay["gorunen_kisi_sayisi"] = len(kisiler)
-                    if olay["olay"] == "yerde_hareketsiz" and ISKELET_RESMI_EKLE:
+                    if (olay["olay"] in ("yerde_hareketsiz", "gorus_disi_dusme")
+                            and ISKELET_RESMI_EKLE and iz.goruntu is not None):
                         resim, jpeg = iskelet_resmi(iz, arka_plan)
                         if jpeg is not None:
                             olay["iskelet_jpg_base64"] = base64.b64encode(jpeg).decode("ascii")

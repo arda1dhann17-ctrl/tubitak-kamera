@@ -32,7 +32,7 @@ Kalibrasyondan sonra ortam resmi **canlı güncellenir**, ama yalnızca güvenli
 
 - İnsan görülen bölge (iskelet ve çevresindeki pay) kilitlenir, hiç güncellenmez. Kilit, o bölge tekrar eski haline dönünce (kişi gidince) açılır. Model kişiyi sonradan kaybetse bile (yarım görünme, hareketsiz yatma) bölge kilitli kalır.
 - Bir değişiklik (taşınan dolap, ışık) ancak 60 sn (`ARKA_SABIT_SN`) hiç kıpırdamadan durursa ortama işlenir. Yürüyen biri hiç işlenmez.
-- Güncel ortam 10 dakikada bir `arka_plan.png` dosyasına yazılır.
+- Güncel ortam 10 dakikada bir `arka_plan.png` dosyasına yazılır. Pi 3'ü yormamak için bu güncelleme saniyede yalnızca bir kez yapılır.
 
 İstenirse yeniden kalibrasyon şu üç yoldan biriyle başlatılır (örneğin kilitli kalan bir bölgede eşya yer değiştirdiyse):
 
@@ -40,17 +40,25 @@ Kalibrasyondan sonra ortam resmi **canlı güncellenir**, ama yalnızca güvenli
 - Program klasörüne `arka_plan_kaydet` adlı boş bir dosya koymak
 - MQTT komutu göndermek (aşağıda)
 
+## Düşme algılama
+
+- **Görünür düşme:** Gövde yatay durumdaysa ve kişi 5 sn kıpırdamazsa `yerde_hareketsiz` alarmı verilir.
+- **Görüş dışına düşme (masa ya da tezgah arkası):** Kişi ani bir düşüş yaptıktan ya da yattıktan sonra görüş alanından kaybolursa veya yalnızca başı ve omuzları görünüp duruşu ölçülemezse 10 sn (`GIZLI_BEKLEME_SN`) beklenir. Bu sürede ayakta görünmezse `gorus_disi_dusme` alarmı verilir. Çerçevenin kenarından çıkan kişi için alarm verilmez, odadan çıkmış sayılır. Masada dik oturan kişi için de alarm verilmez (baş omuzların üstündeyse).
+- **Acil durum butonu (Arduino):** Kamera kişiyi hiç göremese bile butona basılarak yardım çağrılabilir.
+
+Eşikler (`ANI_DUSUS_ORANI`, `GIZLI_BEKLEME_SN`, `UST_DIK_ACISI`) atölyede yapılacak denemelerle ayarlanmalıdır.
+
 ## MQTT konuları
 
 `<istasyon>` yerine `ISTASYON_ADI` yazılır (varsayılan değeri `atolye-1`). Bütün mesajlar JSON biçimindedir.
 
 | Konu | Yön | İçerik |
 | --- | --- | --- |
-| `atolye/<istasyon>/dusme` | Pi → uygulama | `yerde_hareketsiz` (iskelet resmi `iskelet_jpg_base64` alanında), `kisi_kalkti` |
+| `atolye/<istasyon>/dusme` | Pi → uygulama | `yerde_hareketsiz` ve `gorus_disi_dusme` (iskelet resmi `iskelet_jpg_base64` alanında), `kisi_kalkti`, `acil_buton`, `acil_buton_iptal`, `alarm_kapatildi` |
 | `atolye/<istasyon>/gaz` | Pi → uygulama | `gaz_alarmi`, `duman_alarmi` (`deger` ile birlikte), `gaz_temiz`, `duman_temiz` |
 | `atolye/<istasyon>/olcum` | Pi → uygulama | `{"olay":"olcum","gaz":412,"duman":300}`, 5 saniyede bir (son değer broker'da saklanır) |
 | `atolye/<istasyon>/durum` | Pi → uygulama | `cevrimici` / `cevrimdisi` (saklanır), `kalibrasyon_basladi`, `arka_plan_kaydedildi`, `arduino_hazir`, `arduino_koptu`, `sensor_isiniyor` |
-| `atolye/<istasyon>/komut` | uygulama → Pi | `arka_plan_kaydet` (ortamı yeniden kaydet), `sustur` (buzzer'ı 5 dk sustur). Düz metin ya da `{"komut":"..."}` |
+| `atolye/<istasyon>/komut` | uygulama → Pi | `arka_plan_kaydet` (ortamı yeniden kaydet), `sustur` (buzzer'ı 5 dk sustur), `alarm_kapat` (yardım geldi: düşme ve acil buton alarmlarını kapat). Düz metin ya da `{"komut":"..."}` |
 
 Telefon olmadan deneme:
 
@@ -69,6 +77,7 @@ Kod `arduino/acil_durum_istasyonu/acil_durum_istasyonu.ino` dosyasında. Arduino
 | Duman sensörü (örn. MQ-2) analog çıkışı (AO) | A1 |
 | Buzzer (+) | D8 |
 | RGB LED kırmızı / yeşil / mavi (220 Ω dirençle) | D9 / D10 / D11 |
+| Acil durum butonu (bir ucu D2'ye, diğer ucu GND'ye) | D2 |
 | Sensör VCC / GND | 5V / GND |
 
 Ayarlar dosyanın başında bulunur: eşik değerleri (`GAZ_ESIK`, `DUMAN_ESIK`), ortak anotlu LED ve pasif buzzer seçimi. MQ sensörleri ilk 60 saniye ısınır, bu sürede alarm verilmez ve ışık mavi yanar. Eşikler atölyede `OLCUM` değerlerine bakılarak ayarlanmalıdır.
@@ -77,6 +86,7 @@ Işık ve ses:
 
 | Durum | Işık | Buzzer |
 | --- | --- | --- |
+| Acil buton | kırmızı, hızlı yanıp söner | hızlı bip |
 | Duman | mor, hızlı yanıp söner | hızlı bip |
 | Gaz | turuncu, hızlı yanıp söner | hızlı bip |
 | Düşme (Pi'den `DUSME`) | kırmızı, yavaş yanıp söner | kesik bip |
@@ -86,7 +96,7 @@ Işık ve ses:
 
 Seri protokol (9600 baud, her mesaj bir satır):
 
-- Pi → Arduino: `DUSME`, `TAMAM`, `SUSTUR`, `PING` (10 sn'de bir)
-- Arduino → Pi: `HAZIR`, `ISINIYOR kalan=45`, `OLCUM gaz=412 duman=300`, `ALARM gaz=612`, `ALARM duman=700`, `TEMIZ gaz`, `TEMIZ duman`, `SUSTURULDU`
+- Pi → Arduino: `DUSME`, `TAMAM`, `SUSTUR`, `SIFIRLA`, `PING` (10 sn'de bir)
+- Arduino → Pi: `HAZIR`, `ISINIYOR kalan=45`, `OLCUM gaz=412 duman=300`, `ALARM gaz=612`, `ALARM duman=700`, `TEMIZ gaz`, `TEMIZ duman`, `SUSTURULDU`, `ACIL` (butona kısa basış), `ACIL_IPTAL` (3 sn basılı tutma)
 
 Arduino, Pi'den bağımsız olarak da çalışır: gaz ya da duman algılarsa Pi kapalı olsa bile buzzer ve ışıkla uyarır.
