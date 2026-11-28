@@ -79,8 +79,17 @@ GENIS_ESLESME = 2.5        # supheli kisi kaybolunca yakininda gorunen kisi ayni
 UST_DIK_ACISI = 40         # bas-omuz cizgisi dikeye bu acidan yakinsa "dik oturuyor"
 KENAR_PAYI = 0.08          # cerceve kenarina bu oranda yakin kaybolan kisi cikmis sayilir
 KENAR_TEMAS_PAYI = 0.03    # vucudu cerceve kenarina degen kisi (yarisi disarida) icin de
-# Arka plan (atolye ortami): program acilir acilmaz canli ogrenilir, bekleme yok.
-# Insanlar ortam resmine HIC islenmez; insanlar her zaman sadece iskelet cizilir.
+# GORUNTU: Ekranda ve alarm resminde CANLI kamera goruntusu kullanilir (koltuk
+# oynarsa oda da aninda oynar), ama insanlarin bulundugu bolgeler her karede
+# silinir: oraya ogrenilen bos ortam (bilinmiyorsa gri) konur, ustune iskelet
+# cizilir. Boylece kimsenin yuzu/vucudu gorunmez. Video kaydedilmez.
+# Silinen bolge: o karedeki insanlar + son GIZLEME_HAFIZA_SN icinde gorulenler
+# (model bir kare kacirsa bile kisi gorunmesin) + dusmus/supheli kisinin son
+# goruldugu yer (masa arkasinda yarim kalsa bile gorunmesin).
+CANLI_GORUNTU = True          # False: kamera hic kullanilmaz, sadece ogrenilen ortam
+GIZLEME_HAFIZA_SN = 2.0
+# Arka plan (atolye ortami): insanlarin arkasini doldurmak icin canli ogrenilir.
+# Insanlar ortam resmine HIC islenmez.
 #  - Insan goruldugu bolge (iskelet + guvenlik payi) "kilitlenir". Kilit, o piksel
 #    eski ortam rengine donunce (kisi gidince) acilir. Model kisiyi sonradan
 #    kaybetse de (yarim gorunme, hareketsiz yatma) o bolge karismaz.
@@ -99,7 +108,7 @@ ARKA_PLAN_DOSYASI = os.path.join(
 ARKA_SIFIRLA_TETIK_DOSYASI = "arka_plan_kaydet"
 ARKA_CANLI_GUNCELLE = True
 ARKA_ILK_SABIT_SN = 3        # bilinmeyen yer bu kadar sabitse hemen ogrenilir
-ARKA_SABIT_SN = 60           # bilinen yerdeki degisiklik bu kadar sabit kalirsa islenir
+ARKA_SABIT_SN = 15           # bilinen yerdeki degisiklik bu kadar sabit kalirsa islenir
 ARKA_KILITLI_BOS_SN = 30     # insan gittikten sonra bos kalan bilinmeyen yer
 ARKA_HAREKET_ESIGI = 18      # kareler arasi renk farki (0-255) bundan buyukse "hareket"
 ARKA_KILIT_ACMA_ESIGI = 20   # piksel eski ortama bu kadar yakinsa kilit acilir
@@ -385,6 +394,8 @@ class DusmeTakipcisi:
         self.kenarda = False
         self.gizli_basi = None
         self.alarm_turu = None
+        self.son_kisi = None
+        self.son_kisi_t = None
 
     @property
     def supheli(self):
@@ -632,6 +643,7 @@ class Izleyici:
             else:
                 kisi = kisiler[sira]
                 iz.kisi = kisi
+                iz.son_kisi, iz.son_kisi_t = kisi, t
                 iz.merkez, iz.boyut = kisi.merkez, kisi.boyut
                 iz.goruntu = (kisiler, sira)
                 _, olay, iz.bilgi = iz.guncelle(t, kisi.nokta)
@@ -707,6 +719,7 @@ class ArkaPlan:
         self.maske = np.zeros((h, w), dtype=np.uint8)
         self.son_canli = None
         self.son_kayit = None
+        self._onbellek = None
 
     def sifirla_ve_yeniden_ogren(self):
         self._sifirla()
@@ -719,6 +732,7 @@ class ArkaPlan:
         if self.son_canli is not None and t - self.son_canli < ARKA_GUNCELLEME_SN:
             return
         self.son_canli = t
+        self._onbellek = None
         if self.son_kayit is None:
             self.son_kayit = t
 
@@ -770,9 +784,11 @@ class ArkaPlan:
                 print("[HATA] Arka plan kaydedilemedi:", hata)
 
     def goruntu(self):
-        resim = self.resim_f.astype(np.uint8)
-        resim[self.bilinen == 0] = ISKELET_ZEMIN_RENGI
-        return resim
+        if self._onbellek is None:
+            resim = self.resim_f.astype(np.uint8)
+            resim[self.bilinen == 0] = ISKELET_ZEMIN_RENGI
+            self._onbellek = resim
+        return self._onbellek
 
 
 class MqttBaglanti:
@@ -1011,12 +1027,40 @@ class Arduino:
                 pass
 
 
-def iskelet_resmi(iz, arka_plan=None):
+def gizlenecek_maske(t, kisiler, izleyici):
+    """Bu karede silinecek (insan olan / olabilecek) bolgeler."""
+    maske = np.zeros((YUKSEKLIK, GENISLIK), dtype=np.uint8)
+    for kisi in kisiler:
+        insan_maskesi(maske, kisi)
+    for iz in izleyici.izler.values():
+        if iz.kisi is not None or iz.son_kisi is None:
+            continue
+        yakin_zamanda = t - iz.son_kisi_t <= GIZLEME_HAFIZA_SN
+        if yakin_zamanda or iz.supheli:
+            insan_maskesi(maske, iz.son_kisi)
+    return maske
+
+
+def canli_sahne(kare, maske, arka_plan):
+    """Canli kare; insan bolgeleri bos ortamla (bilinmiyorsa gri) degistirilir."""
+    if arka_plan is not None:
+        dolgu = arka_plan.goruntu()
+    else:
+        dolgu = np.full_like(kare, ISKELET_ZEMIN_RENGI)
+    if not CANLI_GORUNTU:
+        return dolgu.copy()
+    sahne = kare.copy()
+    np.copyto(sahne, dolgu, where=(maske > 0)[..., None])
+    return sahne
+
+
+def iskelet_resmi(iz, zemin=None):
+    """Alarm resmi: zemin (canli sahne, insanlar silinmis) + iskeletler."""
     kisiler, sira = iz.goruntu
     k = ISKELET_RESMI_OLCEK
     w, h = GENISLIK * k, YUKSEKLIK * k
-    if arka_plan is not None:
-        resim = cv2.resize(arka_plan.goruntu(), (w, h), interpolation=cv2.INTER_LINEAR)
+    if zemin is not None:
+        resim = cv2.resize(zemin, (w, h), interpolation=cv2.INTER_LINEAR)
     else:
         resim = np.full((h, w, 3), ISKELET_ZEMIN_RENGI, dtype=np.uint8)
 
@@ -1219,11 +1263,14 @@ def main():
                         print(f"[DURUM] #{iz.kimlik}: {iz.yazilan_durum} -> {iz.durum}")
                         iz.yazilan_durum = iz.durum
 
+                gizle = gizlenecek_maske(t, kisiler, izleyici)
+                sahne = canli_sahne(kare, gizle, arka_plan)
+
                 for iz, olay in olaylar:
                     olay["gorunen_kisi_sayisi"] = len(kisiler)
                     if (olay["olay"] in ("yerde_hareketsiz", "gorus_disi_dusme")
                             and ISKELET_RESMI_EKLE and iz.goruntu is not None):
-                        resim, jpeg = iskelet_resmi(iz, arka_plan)
+                        resim, jpeg = iskelet_resmi(iz, sahne)
                         if jpeg is not None:
                             olay["iskelet_jpg_base64"] = base64.b64encode(jpeg).decode("ascii")
                             if ISKELET_DOSYAYA_KAYDET:
@@ -1245,18 +1292,11 @@ def main():
                         son_ping = t
 
                 if goster:
-                    # Canli pencere: kamera goruntusu DEGIL, ogrenilen atolye ortami +
-                    # iskeletler (insanlar hicbir zaman gorunmez).
+                    # Canli pencere: canli oda goruntusu, insanlar silinmis + iskeletler.
                     k = 2  # 640x480'de ciz, yazilar net olsun
-                    if arka_plan is not None:
-                        tuval = cv2.resize(arka_plan.goruntu(), (GENISLIK * k, YUKSEKLIK * k))
-                    else:
-                        tuval = np.zeros((YUKSEKLIK * k, GENISLIK * k, 3), dtype=np.uint8)
+                    tuval = cv2.resize(sahne, (GENISLIK * k, YUKSEKLIK * k))
                     canli_ciz(tuval, izleyici, k)
                     bilgi_yaz(tuval, izleyici, t, len(kisiler))
-                    if arka_plan is not None and arka_plan.bilinen_orani() < 0.95:
-                        yazi_yaz(tuval, f"ortam ogreniliyor %{arka_plan.bilinen_orani() * 100:.0f}",
-                                 (10, 60), (255, 220, 0), 0.6)
                     cv2.imshow(PENCERE_ADI, tuval)
                     tus = cv2.waitKey(1) & 0xFF
                     if tus == ord("q"):

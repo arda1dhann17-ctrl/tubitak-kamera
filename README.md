@@ -36,11 +36,15 @@ allow_anonymous true
 
 Bilgisayarda çalıştırılırsa daha isabetli `full` model ve 15 kare/sn, Raspberry Pi'de hafif `lite` model ve 5 kare/sn kullanılır (otomatik).
 
-Canlı pencerede kamera görüntüsü **gösterilmez**: atölye ortamı ve üstünde insanların iskeleti görünür. Ortam resmi program açılır açılmaz **beklemeden, canlı** öğrenilir (birkaç saniyede dolar). İnsanların bulunduğu yerler, kişi oradan gidene kadar gri kalır. Güncelleme yalnızca güvenli piksellerde yapılır:
+Canlı pencerede ve alarm resminde oda **canlı** görünür (koltuk oynarsa görüntüde de anında oynar), ama **insanlar her karede silinir**: bulundukları bölge (iskelet + güvenlik payı) boş ortam resmiyle doldurulur, üstüne iskelet çizilir. Silinen bölgeye ayrıca son 2 sn içinde görülen kişiler (model bir kare kaçırsa bile) ve düşmüş/şüpheli kişinin son görüldüğü yer (masa arkasında yarım kalsa bile) dahildir. Video kaydedilmez. Kamera görüntüsü hiç istenmezse `CANLI_GORUNTU = False` yapılır.
+
+> Sınır: Model bir kişiyi **hiç** algılamazsa (çok uzak, çok karanlık, büyük kısmı kapalı) o kişi canlı görüntüde görünebilir.
+
+İnsanların arkasını doldurmak için boş ortam resmi program açılır açılmaz **beklemeden** öğrenilir; henüz bilinmeyen yerler gri görünür. Güncelleme yalnızca güvenli piksellerde yapılır:
 
 - İnsan görülen bölge (iskelet ve çevresindeki pay) kilitlenir, hiç güncellenmez. Kilit, o bölge tekrar eski haline dönünce (kişi gidince) açılır. Model kişiyi sonradan kaybetse bile (yarım görünme, hareketsiz yatma) bölge kilitli kalır.
 - Henüz bilinmeyen boş yerler 3 sn kıpırdamadan durunca öğrenilir.
-- Bilinen yerdeki bir değişiklik (taşınan dolap, ışık) ancak 60 sn (`ARKA_SABIT_SN`) hiç kıpırdamadan durursa ortama işlenir. Yürüyen biri hiç işlenmez.
+- Bilinen yerdeki bir değişiklik (taşınan dolap, ışık) ancak 15 sn (`ARKA_SABIT_SN`) hiç kıpırdamadan durursa ortama işlenir. Yürüyen biri hiç işlenmez.
 - Güncel ortam 10 dakikada bir `arka_plan.png` dosyasına yazılır. Pi 3'ü yormamak için bu güncelleme saniyede yalnızca bir kez yapılır.
 
 Ortam resmi istenirse sıfırlanıp baştan öğrenilir (örneğin kilitli kalan bir bölgede eşya yer değiştirdiyse):
