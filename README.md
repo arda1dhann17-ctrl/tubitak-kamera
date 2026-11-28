@@ -34,15 +34,16 @@ allow_anonymous true
 
 Çalıştırma: `python3 raspberry_pi/kamera_dusme_algilama.py`
 
-İlk açılışta **5 dakika kalibrasyon** yapılır. Bu sürede oda boş bırakılır ve atölyenin boş hali `arka_plan.png` olarak kaydedilir.
+Bilgisayarda çalıştırılırsa daha isabetli `full` model ve 15 kare/sn, Raspberry Pi'de hafif `lite` model ve 5 kare/sn kullanılır (otomatik).
 
-Kalibrasyondan sonra ortam resmi **canlı güncellenir**, ama yalnızca güvenli piksellerde:
+Canlı pencerede kamera görüntüsü **gösterilmez**: atölye ortamı ve üstünde insanların iskeleti görünür. Ortam resmi program açılır açılmaz **beklemeden, canlı** öğrenilir (birkaç saniyede dolar). İnsanların bulunduğu yerler, kişi oradan gidene kadar gri kalır. Güncelleme yalnızca güvenli piksellerde yapılır:
 
 - İnsan görülen bölge (iskelet ve çevresindeki pay) kilitlenir, hiç güncellenmez. Kilit, o bölge tekrar eski haline dönünce (kişi gidince) açılır. Model kişiyi sonradan kaybetse bile (yarım görünme, hareketsiz yatma) bölge kilitli kalır.
-- Bir değişiklik (taşınan dolap, ışık) ancak 60 sn (`ARKA_SABIT_SN`) hiç kıpırdamadan durursa ortama işlenir. Yürüyen biri hiç işlenmez.
+- Henüz bilinmeyen boş yerler 3 sn kıpırdamadan durunca öğrenilir.
+- Bilinen yerdeki bir değişiklik (taşınan dolap, ışık) ancak 60 sn (`ARKA_SABIT_SN`) hiç kıpırdamadan durursa ortama işlenir. Yürüyen biri hiç işlenmez.
 - Güncel ortam 10 dakikada bir `arka_plan.png` dosyasına yazılır. Pi 3'ü yormamak için bu güncelleme saniyede yalnızca bir kez yapılır.
 
-İstenirse yeniden kalibrasyon şu üç yoldan biriyle başlatılır (örneğin kilitli kalan bir bölgede eşya yer değiştirdiyse):
+Ortam resmi istenirse sıfırlanıp baştan öğrenilir (örneğin kilitli kalan bir bölgede eşya yer değiştirdiyse):
 
 - Pencerede `k` tuşuna basmak
 - Program klasörüne `arka_plan_kaydet` adlı boş bir dosya koymak
@@ -50,7 +51,7 @@ Kalibrasyondan sonra ortam resmi **canlı güncellenir**, ama yalnızca güvenli
 
 ## Düşme algılama
 
-- **Görünür düşme:** Gövde yatay durumdaysa ve kişi 5 sn kıpırdamazsa `yerde_hareketsiz` alarmı verilir.
+- **Görünür düşme:** Gövde yatay, baş kalça hizasında ve kişi 5 sn kıpırdamazsa `yerde_hareketsiz` alarmı verilir. Yatma kararı tek kareye göre değil, son 1,5 sn'deki karelerin %70'ine göre verilir; böylece iskelet titremesi yanlış alarm üretmez. Kişi kalkınca (kalçası görünmese bile gövdesi dikse) sayaç hemen iptal olur.
 - **Görüş dışına düşme (masa ya da tezgah arkası):** Kişi ani bir düşüş yaptıktan ya da yattıktan sonra görüş alanından kaybolursa veya yalnızca başı ve omuzları görünüp duruşu ölçülemezse 10 sn (`GIZLI_BEKLEME_SN`) beklenir. Bu sürede ayakta görünmezse `gorus_disi_dusme` alarmı verilir. Çerçevenin kenarından çıkan kişi için alarm verilmez, odadan çıkmış sayılır. Masada dik oturan kişi için de alarm verilmez (baş omuzların üstündeyse).
 - **Acil durum butonu (Arduino):** Kamera kişiyi hiç göremese bile butona basılarak yardım çağrılabilir.
 
@@ -65,8 +66,8 @@ Eşikler (`ANI_DUSUS_ORANI`, `GIZLI_BEKLEME_SN`, `UST_DIK_ACISI`) atölyede yap�
 | `atolye/<istasyon>/dusme` | Pi → uygulama | `yerde_hareketsiz` ve `gorus_disi_dusme` (iskelet resmi `iskelet_jpg_base64` alanında), `kisi_kalkti`, `acil_buton`, `acil_buton_iptal`, `alarm_kapatildi` |
 | `atolye/<istasyon>/gaz` | Pi → uygulama | `gaz_alarmi`, `duman_alarmi` (`deger` ile birlikte), `gaz_temiz`, `duman_temiz` |
 | `atolye/<istasyon>/olcum` | Pi → uygulama | `{"olay":"olcum","gaz":412,"duman":300}`, 5 saniyede bir (son değer broker'da saklanır) |
-| `atolye/<istasyon>/durum` | Pi → uygulama | `cevrimici` / `cevrimdisi` (saklanır), `kalibrasyon_basladi`, `arka_plan_kaydedildi`, `arduino_hazir`, `arduino_koptu`, `sensor_isiniyor` |
-| `atolye/<istasyon>/komut` | uygulama → Pi | `arka_plan_kaydet` (ortamı yeniden kaydet), `sustur` (buzzer'ı 5 dk sustur), `alarm_kapat` (yardım geldi: düşme ve acil buton alarmlarını kapat). Düz metin ya da `{"komut":"..."}` |
+| `atolye/<istasyon>/durum` | Pi → uygulama | `cevrimici` / `cevrimdisi` (saklanır), `arka_plan_sifirlandi`, `arduino_hazir`, `arduino_koptu`, `sensor_isiniyor` |
+| `atolye/<istasyon>/komut` | uygulama → Pi | `arka_plan_kaydet` (ortam resmini sıfırla ve baştan öğren), `sustur` (buzzer'ı 5 dk sustur), `alarm_kapat` (yardım geldi: düşme ve acil buton alarmlarını kapat). Düz metin ya da `{"komut":"..."}` |
 
 Telefon olmadan deneme:
 
