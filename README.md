@@ -36,7 +36,7 @@ allow_anonymous true
 
 Bilgisayarda çalıştırılırsa daha isabetli `full` model ve 15 kare/sn, Raspberry Pi'de hafif `lite` model ve 5 kare/sn kullanılır (otomatik).
 
-Canlı pencerede ve alarm resminde oda **canlı** görünür (koltuk oynarsa görüntüde de anında oynar), ama **insanlar her karede silinir**: bulundukları bölge (iskelet + güvenlik payı) ortamın insansız son haliyle doldurulur, üstüne siyahımsı iskelet çizilir (eklem noktaları durum renginde: yeşil normal, turuncu sayıyor, kırmızı alarm). Silinen bölgeye ayrıca son 2 sn içinde görülen kişiler (model bir kare kaçırsa bile) ve düşmüş/şüpheli kişinin son görüldüğü yer (masa arkasında yarım kalsa bile) dahildir. Video kaydedilmez. Kamera görüntüsü hiç istenmezse `CANLI_GORUNTU = False` yapılır.
+Canlı pencerede ve alarm resminde oda **canlı** görünür (koltuk oynarsa görüntüde de anında oynar), ama **insanlar her karede silinir**: yapay zekâ modelinin çıkardığı insan silueti (vücudun kendisi + 5 piksel pay) ortamın insansız son haliyle doldurulur ve iskeletin etrafındaki her yer canlı kalır. Üstüne siyahımsı iskelet çizilir (eklem noktaları durum renginde: yeşil normal, turuncu sayıyor, kırmızı alarm). Silinen bölgeye ayrıca son 0,6 sn içindeki siluet (model bir kare kaçırsa bile) ve düşmüş/şüpheli kişinin son silueti (masa arkasında yarım kalsa bile) dahildir. Video kaydedilmez. Kamera görüntüsü hiç istenmezse `CANLI_GORUNTU = False` yapılır.
 
 > Sınır: Model bir kişiyi **hiç** algılamazsa (çok uzak, çok karanlık, büyük kısmı kapalı) o kişi canlı görüntüde görünebilir.
 

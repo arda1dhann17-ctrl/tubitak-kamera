@@ -80,14 +80,17 @@ UST_DIK_ACISI = 40         # bas-omuz cizgisi dikeye bu acidan yakinsa "dik otur
 KENAR_PAYI = 0.08          # cerceve kenarina bu oranda yakin kaybolan kisi cikmis sayilir
 KENAR_TEMAS_PAYI = 0.03    # vucudu cerceve kenarina degen kisi (yarisi disarida) icin de
 # GORUNTU: Ekranda ve alarm resminde CANLI kamera goruntusu kullanilir (koltuk
-# oynarsa oda da aninda oynar), ama insanlarin bulundugu bolgeler her karede
-# silinir: oraya ogrenilen bos ortam (bilinmiyorsa gri) konur, ustune iskelet
+# oynarsa oda da aninda oynar). Yalnizca insanin VUCUT SILUETI (yapay zekanin
+# cikardigi insan maskesi + SILUET_PAYI piksel) silinir; iskeletin etrafindaki
+# her yer canlidir. Silinen yere ortamin insansiz son hali konur, ustune iskelet
 # cizilir. Boylece kimsenin yuzu/vucudu gorunmez. Video kaydedilmez.
-# Silinen bolge: o karedeki insanlar + son GIZLEME_HAFIZA_SN icinde gorulenler
-# (model bir kare kacirsa bile kisi gorunmesin) + dusmus/supheli kisinin son
-# goruldugu yer (masa arkasinda yarim kalsa bile gorunmesin).
+# Ayrica silinir: son GIZLEME_HAFIZA_SN icindeki siluet (model bir kare kacirsa
+# bile kisi gorunmesin) + dusmus/supheli kisinin son silueti (masa arkasi).
 CANLI_GORUNTU = True          # False: kamera hic kullanilmaz, sadece ogrenilen ortam
-GIZLEME_HAFIZA_SN = 2.0
+GIZLEME_HAFIZA_SN = 0.6       # Pi'de ~3 kare
+SILUET_KULLAN = True          # False: siluet yerine iskelet + pay silinir (daha genis)
+SILUET_ESIGI = 0.3            # insan maskesinde bu degerin ustu insan sayilir
+SILUET_PAYI = 5               # siluetin etrafina eklenen pay (piksel, 320x240'ta)
 # Arka plan (insanlarin arkasi): her karede, insan OLMAYAN her piksel canli
 # kareden alinir; yani ortam resmi canli goruntunun "insansiz son hali"dir.
 # Kisinin kapattigi yere, o yerin kisi gelmeden hemen onceki canli hali konur.
@@ -112,7 +115,7 @@ ARKA_SIFIRLA_TETIK_DOSYASI = "arka_plan_kaydet"
 ARKA_HAREKET_ESIGI = 25      # kareler arasi renk farki (0-255) bundan buyukse "hareket"
 ARKA_EK_PAY = 6              # ortama islemeden once insan bolgesine eklenen piksel
 ARKA_DOLGU_SN = 1.0          # bilinmeyen yerlerin tahmini saniyede bir yenilenir
-ARKA_INSAN_PAYI = 0.25       # insan bolgesine eklenen pay (vucut boyunun orani)
+ARKA_INSAN_PAYI = 0.10       # siluet yoksa iskelete eklenen pay (vucut boyunun orani)
 ARKA_KAYDET_SN = 600         # canli guncellenen ortam 10 dk'da bir diske yazilir
 
 # --- MQTT: broker (Mosquitto) Pi'nin kendisinde calisir, uygulama ona baglanir ---
@@ -338,9 +341,10 @@ class HareketOlcer:
 
 class Kisi:
 
-    def __init__(self, nokta, tum):
+    def __init__(self, nokta, tum, siluet=None):
         self.nokta = nokta
         self.tum = tum
+        self.siluet = siluet  # uint8 0/255 maske (insanin vucudu) ya da None
         kaynak = nokta or tum
         xler = [p[0] for p in kaynak.values()]
         yler = [p[1] for p in kaynak.values()]
@@ -348,10 +352,30 @@ class Kisi:
         self.boyut = max(max(xler) - min(xler), max(yler) - min(yler), 1.0)
 
 
+_SILUET_CEKIRDEK = cv2.getStructuringElement(
+    cv2.MORPH_ELLIPSE, (2 * SILUET_PAYI + 1, 2 * SILUET_PAYI + 1))
+
+
+def siluet_al(segmentasyon, genislik, yukseklik):
+    try:
+        harita = segmentasyon.numpy_view()
+    except Exception:
+        return None
+    if harita.ndim == 3:
+        harita = harita[..., 0]
+    if harita.shape[:2] != (yukseklik, genislik):
+        harita = cv2.resize(harita, (genislik, yukseklik))
+    siluet = (harita > SILUET_ESIGI).astype(np.uint8) * 255
+    if not siluet.any():
+        return None
+    return cv2.dilate(siluet, _SILUET_CEKIRDEK)
+
+
 def kisileri_al(sonuc, genislik, yukseklik):
     kisiler = []
     alt_sinir = min(MIN_GORUNURLUK, TAKIP_MIN_GORUNURLUK)
-    for poz in (sonuc.pose_landmarks or []):
+    siluetler = list(getattr(sonuc, "segmentation_masks", None) or [])
+    for sira_no, poz in enumerate(sonuc.pose_landmarks or []):
         nokta, tum = {}, {}
         for no, n in enumerate(poz):
             gorunurluk = 1.0 if n.visibility is None else n.visibility
@@ -362,7 +386,10 @@ def kisileri_al(sonuc, genislik, yukseklik):
             if gorunurluk >= alt_sinir:
                 tum[no] = (x, y)
         if nokta or tum:
-            kisiler.append(Kisi(nokta, tum))
+            siluet = None
+            if SILUET_KULLAN and sira_no < len(siluetler):
+                siluet = siluet_al(siluetler[sira_no], genislik, yukseklik)
+            kisiler.append(Kisi(nokta, tum, siluet))
     return kisiler
 
 
@@ -676,6 +703,18 @@ def yazi_yaz(resim, metin, konum, renk, olcek=0.35):
 
 
 def insan_maskesi(maske, kisi):
+    siluet = getattr(kisi, "siluet", None)
+    if siluet is not None:
+        # Vucut silueti + bas cevresi (sac/yuz maskeden tasmasin diye kucuk daire).
+        cv2.bitwise_or(maske, siluet, dst=maske)
+        noktalar = kisi.tum or kisi.nokta
+        bas = [noktalar[i] for i in range(0, 11) if i in noktalar]
+        if bas:
+            pts = np.array(bas, dtype=np.float32)
+            cx, cy = pts.mean(axis=0)
+            r = max(10, int(0.12 * kisi.boyut))
+            cv2.circle(maske, (int(cx), int(cy)), r, 255, -1)
+        return
     noktalar = dict(kisi.tum or kisi.nokta)
     omuz = ortalama_nokta(noktalar, (SOL_OMUZ, SAG_OMUZ))
     if BURUN in noktalar and omuz is not None:
@@ -1170,6 +1209,7 @@ def main():
         min_pose_detection_confidence=0.5,
         min_pose_presence_confidence=0.5,
         min_tracking_confidence=0.5,
+        output_segmentation_masks=SILUET_KULLAN,
     )
 
     kare_suresi = 1.0 / HEDEF_FPS
