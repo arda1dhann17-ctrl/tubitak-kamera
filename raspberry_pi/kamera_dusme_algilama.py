@@ -88,34 +88,32 @@ KENAR_TEMAS_PAYI = 0.03    # vucudu cerceve kenarina degen kisi (yarisi disarida
 # goruldugu yer (masa arkasinda yarim kalsa bile gorunmesin).
 CANLI_GORUNTU = True          # False: kamera hic kullanilmaz, sadece ogrenilen ortam
 GIZLEME_HAFIZA_SN = 2.0
-# Arka plan (atolye ortami): insanlarin arkasini doldurmak icin canli ogrenilir.
-# Insanlar ortam resmine HIC islenmez.
-#  - Insan goruldugu bolge (iskelet + guvenlik payi) "kilitlenir". Kilit, o piksel
-#    eski ortam rengine donunce (kisi gidince) acilir. Model kisiyi sonradan
-#    kaybetse de (yarim gorunme, hareketsiz yatma) o bolge karismaz.
-#  - Henuz bilinmeyen yerler ARKA_ILK_SABIT_SN kipirdamadan durunca ogrenilir.
-#  - Bilinen yerdeki bir degisiklik (tasinan dolap, isik) ARKA_SABIT_SN boyunca
-#    hic kipirdamazsa ortama islenir. Yuruyen biri hic islenmez.
-# Ortam resmi sifirlanip bastan ogrenilebilir: pencerede "k" tusu, klasore
-# "arka_plan_kaydet" adli bos dosya koymak veya MQTT "arka_plan_kaydet".
+# Arka plan (insanlarin arkasi): her karede, insan OLMAYAN her piksel canli
+# kareden alinir; yani ortam resmi canli goruntunun "insansiz son hali"dir.
+# Kisinin kapattigi yere, o yerin kisi gelmeden hemen onceki canli hali konur.
+# Kisi cekilince goruntu ziplamaz (ayni resim). Hic bos gorulmemis yerler
+# (program acildiginda kisinin durdugu yer) cevreden tahminle doldurulur.
+# Insan bolgesi (+ guvenlik payi + son 2 sn) ve o an hareket eden pikseller
+# ortama hic islenmez.
+# Ortam resmi sifirlanabilir: pencerede "k" tusu, klasore "arka_plan_kaydet"
+# adli bos dosya koymak veya MQTT "arka_plan_kaydet".
 ISKELET_RESMI_EKLE = True
 ISKELET_RESMI_OLCEK = 2
 ISKELET_RESMI_KALITE = 70
-ISKELET_ZEMIN_RENGI = (60, 60, 60)  # ortami henuz bilinmeyen yerler
+ISKELET_ZEMIN_RENGI = (60, 60, 60)  # hicbir sey bilinmiyorsa
+# Iskelet: siyahimsi cizgi, acik renk kenar (koyu zeminde de gorunsun).
+# Eklem noktalari durum rengindedir (yesil normal, turuncu sayiyor, kirmizi alarm).
+ISKELET_RENGI = (25, 25, 25)
+ISKELET_KENAR_RENGI = (210, 210, 210)
 ARKA_PLAN_KULLAN = True
 ARKA_PLAN_DOSYASI = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "arka_plan.png")
 ARKA_SIFIRLA_TETIK_DOSYASI = "arka_plan_kaydet"
-ARKA_CANLI_GUNCELLE = True
-ARKA_ILK_SABIT_SN = 3        # bilinmeyen yer bu kadar sabitse hemen ogrenilir
-ARKA_SABIT_SN = 15           # bilinen yerdeki degisiklik bu kadar sabit kalirsa islenir
-ARKA_KILITLI_BOS_SN = 30     # insan gittikten sonra bos kalan bilinmeyen yer
-ARKA_HAREKET_ESIGI = 18      # kareler arasi renk farki (0-255) bundan buyukse "hareket"
-ARKA_KILIT_ACMA_ESIGI = 20   # piksel eski ortama bu kadar yakinsa kilit acilir
-ARKA_OGRENME_HIZI = 0.3      # sabit bolgeler ortama ne hizla islensin (saniyede bir)
+ARKA_HAREKET_ESIGI = 25      # kareler arasi renk farki (0-255) bundan buyukse "hareket"
+ARKA_EK_PAY = 6              # ortama islemeden once insan bolgesine eklenen piksel
+ARKA_DOLGU_SN = 1.0          # bilinmeyen yerlerin tahmini saniyede bir yenilenir
 ARKA_INSAN_PAYI = 0.25       # insan bolgesine eklenen pay (vucut boyunun orani)
 ARKA_KAYDET_SN = 600         # canli guncellenen ortam 10 dk'da bir diske yazilir
-ARKA_GUNCELLEME_SN = 1.0     # canli guncelleme saniyede 1 kez (Pi 3'u yormamak icin)
 
 # --- MQTT: broker (Mosquitto) Pi'nin kendisinde calisir, uygulama ona baglanir ---
 #   atolye/<istasyon>/dusme  : yerde_hareketsiz (iskelet resmiyle), kisi_kalkti
@@ -697,7 +695,7 @@ def insan_maskesi(maske, kisi):
 
 
 class ArkaPlan:
-    """Atolye ortamini canli ogrenir; insan bolgelerini hic ogrenmez."""
+    """Canli goruntunun insansiz son hali. Insan bolgeleri hic islenmez."""
 
     def __init__(self, genislik, yukseklik):
         self.boyut = (yukseklik, genislik)
@@ -705,21 +703,20 @@ class ArkaPlan:
         if os.path.exists(ARKA_PLAN_DOSYASI):
             resim = cv2.imread(ARKA_PLAN_DOSYASI)
             if resim is not None and resim.shape[:2] == self.boyut:
-                self.resim_f[:] = resim
+                self.resim[:] = resim
                 self.bilinen[:] = 255
                 print("[ARKA PLAN] Kayitli atolye resmi yuklendi, canli guncellenecek.")
 
     def _sifirla(self):
         h, w = self.boyut
-        self.resim_f = np.zeros((h, w, 3), dtype=np.float32)
+        self.resim = np.zeros((h, w, 3), dtype=np.uint8)
         self.bilinen = np.zeros((h, w), dtype=np.uint8)
         self.onceki = None
-        self.son_hareket = np.zeros((h, w), dtype=np.float32)
-        self.kilit = np.zeros((h, w), dtype=np.uint8)
-        self.maske = np.zeros((h, w), dtype=np.uint8)
-        self.son_canli = None
         self.son_kayit = None
-        self._onbellek = None
+        self._dolgu = None
+        self._dolgu_t = None
+        self._ek = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (2 * ARKA_EK_PAY + 1, 2 * ARKA_EK_PAY + 1))
 
     def sifirla_ve_yeniden_ogren(self):
         self._sifirla()
@@ -728,67 +725,52 @@ class ArkaPlan:
     def bilinen_orani(self):
         return cv2.countNonZero(self.bilinen) / self.bilinen.size
 
-    def guncelle(self, t, kare, kisiler):
-        if self.son_canli is not None and t - self.son_canli < ARKA_GUNCELLEME_SN:
-            return
-        self.son_canli = t
-        self._onbellek = None
+    def guncelle(self, t, kare, insan):
+        """insan: gizlenecek maske (uint8) ya da kisi listesi."""
+        if not isinstance(insan, np.ndarray):
+            maske = np.zeros(self.boyut, dtype=np.uint8)
+            for kisi in insan:
+                insan_maskesi(maske, kisi)
+            insan = maske
         if self.son_kayit is None:
             self.son_kayit = t
-
-        # 1) Bu karedeki insan bolgeleri -> kilitle.
-        self.maske[:] = 0
-        for kisi in kisiler:
-            insan_maskesi(self.maske, kisi)
-        cv2.bitwise_or(self.kilit, self.maske, dst=self.kilit)
-        insan_yok = self.maske == 0
-
-        # 2) Hareket: onceki ornege gore belirgin degisen pikseller.
-        if self.onceki is None:
-            self.onceki = kare.copy()
-            self.son_hareket[:] = t
-            return
-        hareket = cv2.absdiff(kare, self.onceki).max(axis=2) > ARKA_HAREKET_ESIGI
-        self.son_hareket[hareket] = t
-        self.onceki[:] = kare
-        sabit_sure = t - self.son_hareket
-        bilinen = self.bilinen > 0
-        kilitli = self.kilit > 0
-
-        # 3) Kilit acma. Bilinen yer: piksel eski ortama donunce (kisi gidince).
-        resim = self.resim_f.astype(np.uint8)
-        ortama_yakin = cv2.absdiff(kare, resim).max(axis=2) <= ARKA_KILIT_ACMA_ESIGI
-        self.kilit[bilinen & kilitli & insan_yok & ortama_yakin] = 0
-        #    Bilinmeyen yer: insan gittikten sonra uzun sure bos ve sabit kalinca.
-        self.kilit[~bilinen & kilitli & insan_yok
-                   & (sabit_sure >= ARKA_KILITLI_BOS_SN)] = 0
-        kilitsiz = self.kilit == 0
-
-        # 4) Bilinmeyen, kilitsiz ve birkac saniyedir sabit yerler hemen ogrenilir.
-        ilk = ~bilinen & kilitsiz & insan_yok & (sabit_sure >= ARKA_ILK_SABIT_SN)
-        if ilk.any():
-            self.resim_f[ilk] = kare[ilk]
-            self.bilinen[ilk] = 255
-
-        # 5) Bilinen yerlerde uzun sure sabit kalan degisiklik ortama islenir.
-        ogren = (bilinen & kilitsiz & insan_yok
-                 & (sabit_sure >= ARKA_SABIT_SN)).astype(np.uint8) * 255
-        if cv2.countNonZero(ogren):
-            cv2.accumulateWeighted(kare, self.resim_f, ARKA_OGRENME_HIZI, mask=ogren)
+        yasak = cv2.dilate(insan, self._ek) > 0
+        if self.onceki is not None:
+            # O an kipirdayan piksel (yeni giren, hizli kol) islenmez.
+            yasak |= cv2.absdiff(kare, self.onceki).max(axis=2) > ARKA_HAREKET_ESIGI
+        self.onceki = kare.copy()
+        yaz = ~yasak
+        np.copyto(self.resim, kare, where=yaz[..., None])
+        self.bilinen[yaz] = 255
 
         if t - self.son_kayit >= ARKA_KAYDET_SN and self.bilinen_orani() > 0.95:
             self.son_kayit = t
             try:
-                cv2.imwrite(ARKA_PLAN_DOSYASI, self.goruntu())
+                cv2.imwrite(ARKA_PLAN_DOSYASI, self.goruntu(t))
             except Exception as hata:
                 print("[HATA] Arka plan kaydedilemedi:", hata)
 
-    def goruntu(self):
-        if self._onbellek is None:
-            resim = self.resim_f.astype(np.uint8)
-            resim[self.bilinen == 0] = ISKELET_ZEMIN_RENGI
-            self._onbellek = resim
-        return self._onbellek
+    def goruntu(self, t=None):
+        """Ortam resmi; hic gorulmemis yerler cevreden tahminle doldurulur."""
+        bilinmeyen = self.bilinen == 0
+        if not bilinmeyen.any():
+            return self.resim
+        if not self.bilinen.any():
+            return np.full_like(self.resim, ISKELET_ZEMIN_RENGI)
+        if (self._dolgu is None or t is None or self._dolgu_t is None
+                or t - self._dolgu_t >= ARKA_DOLGU_SN):
+            # Kucuk boyutta (80x60) doldur: Pi 3'te birkac ms.
+            h, w = self.boyut
+            kucuk = cv2.resize(self.resim, (w // 4, h // 4), interpolation=cv2.INTER_AREA)
+            km = cv2.resize(self.bilinen, (w // 4, h // 4), interpolation=cv2.INTER_AREA)
+            km = (km < 250).astype(np.uint8) * 255
+            dolu = cv2.inpaint(kucuk, km, 5, cv2.INPAINT_TELEA)
+            dolu = cv2.GaussianBlur(dolu, (5, 5), 0)
+            self._dolgu = cv2.resize(dolu, (w, h), interpolation=cv2.INTER_LINEAR)
+            self._dolgu_t = t
+        resim = self.resim.copy()
+        resim[bilinmeyen] = self._dolgu[bilinmeyen]
+        return resim
 
 
 class MqttBaglanti:
@@ -1042,9 +1024,9 @@ def gizlenecek_maske(t, kisiler, izleyici):
 
 
 def canli_sahne(kare, maske, arka_plan):
-    """Canli kare; insan bolgeleri bos ortamla (bilinmiyorsa gri) degistirilir."""
+    """Canli kare; insan bolgeleri ortamin insansiz son haliyle degistirilir."""
     if arka_plan is not None:
-        dolgu = arka_plan.goruntu()
+        dolgu = arka_plan.goruntu(time.monotonic())
     else:
         dolgu = np.full_like(kare, ISKELET_ZEMIN_RENGI)
     if not CANLI_GORUNTU:
@@ -1069,10 +1051,10 @@ def iskelet_resmi(iz, zemin=None):
 
     for i, kisi in enumerate(kisiler):
         if i != sira:
-            iskelet_ciz(resim, olcekle(kisi.nokta), (0, 200, 0), (0, 200, 0))
+            iskelet_ciz(resim, olcekle(kisi.nokta), ISKELET_RENGI, (0, 200, 0))
     dusen = kisiler[sira]
     dusen_nokta = olcekle(dusen.nokta)
-    iskelet_ciz(resim, dusen_nokta, (0, 0, 255), (0, 0, 255))
+    iskelet_ciz(resim, dusen_nokta, ISKELET_RENGI, (0, 0, 255))
 
     xler = [p[0] for p in dusen_nokta.values()] or [dusen.merkez[0] * k]
     yler = [p[1] for p in dusen_nokta.values()] or [dusen.merkez[1] * k]
@@ -1091,14 +1073,19 @@ def _tam(p):
     return (int(p[0]), int(p[1]))
 
 
-def iskelet_ciz(tuval, noktalar, cizgi_renk=(0, 255, 0), nokta_renk=(0, 0, 255)):
+def iskelet_ciz(tuval, noktalar, cizgi_renk=ISKELET_RENGI, nokta_renk=(0, 0, 255),
+                kalinlik=3):
     if not noktalar:
         return
-    for a, b in BAGLANTILAR:
-        if a in noktalar and b in noktalar:
-            cv2.line(tuval, _tam(noktalar[a]), _tam(noktalar[b]), cizgi_renk, 2)
+    cizgiler = [(_tam(noktalar[a]), _tam(noktalar[b])) for a, b in BAGLANTILAR
+                if a in noktalar and b in noktalar]
+    for p1, p2 in cizgiler:
+        cv2.line(tuval, p1, p2, ISKELET_KENAR_RENGI, kalinlik + 2, cv2.LINE_AA)
+    for p1, p2 in cizgiler:
+        cv2.line(tuval, p1, p2, cizgi_renk, kalinlik, cv2.LINE_AA)
     for p in noktalar.values():
-        cv2.circle(tuval, _tam(p), 3, nokta_renk, -1)
+        cv2.circle(tuval, _tam(p), kalinlik + 1, ISKELET_KENAR_RENGI, -1, cv2.LINE_AA)
+        cv2.circle(tuval, _tam(p), kalinlik, nokta_renk, -1, cv2.LINE_AA)
 
 
 DURUM_RENKLERI = {"NORMAL": (0, 255, 0), "SAYIYOR": (0, 165, 255), "ALARM": (0, 0, 255)}
@@ -1110,7 +1097,7 @@ def canli_ciz(tuval, izleyici, k=1):
             continue
         renk = DURUM_RENKLERI[iz.durum]
         iskelet_ciz(tuval, {i: (p[0] * k, p[1] * k) for i, p in iz.kisi.nokta.items()},
-                    renk, renk)
+                    ISKELET_RENGI, renk)
         x, y = iz.kisi.merkez
         yazi_yaz(tuval, f"#{iz.kimlik}", (int(x * k) + 6, int(y * k)), renk, 0.55)
 
@@ -1255,7 +1242,7 @@ def main():
                         arka_plan.sifirla_ve_yeniden_ogren()
                         guvenli_gonder({"istasyon": ISTASYON_ADI, "olay": "arka_plan_sifirlandi",
                                         "zaman": datetime.now().isoformat(timespec="seconds")})
-                    arka_plan.guncelle(t, kare, kisiler)
+                    arka_plan.guncelle(t, kare, gizlenecek_maske(t, kisiler, izleyici))
                 arka_sifirla_iste = False
 
                 for iz in izleyici.izler.values():

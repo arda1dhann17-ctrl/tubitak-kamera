@@ -36,18 +36,13 @@ allow_anonymous true
 
 Bilgisayarda çalıştırılırsa daha isabetli `full` model ve 15 kare/sn, Raspberry Pi'de hafif `lite` model ve 5 kare/sn kullanılır (otomatik).
 
-Canlı pencerede ve alarm resminde oda **canlı** görünür (koltuk oynarsa görüntüde de anında oynar), ama **insanlar her karede silinir**: bulundukları bölge (iskelet + güvenlik payı) boş ortam resmiyle doldurulur, üstüne iskelet çizilir. Silinen bölgeye ayrıca son 2 sn içinde görülen kişiler (model bir kare kaçırsa bile) ve düşmüş/şüpheli kişinin son görüldüğü yer (masa arkasında yarım kalsa bile) dahildir. Video kaydedilmez. Kamera görüntüsü hiç istenmezse `CANLI_GORUNTU = False` yapılır.
+Canlı pencerede ve alarm resminde oda **canlı** görünür (koltuk oynarsa görüntüde de anında oynar), ama **insanlar her karede silinir**: bulundukları bölge (iskelet + güvenlik payı) ortamın insansız son haliyle doldurulur, üstüne siyahımsı iskelet çizilir (eklem noktaları durum renginde: yeşil normal, turuncu sayıyor, kırmızı alarm). Silinen bölgeye ayrıca son 2 sn içinde görülen kişiler (model bir kare kaçırsa bile) ve düşmüş/şüpheli kişinin son görüldüğü yer (masa arkasında yarım kalsa bile) dahildir. Video kaydedilmez. Kamera görüntüsü hiç istenmezse `CANLI_GORUNTU = False` yapılır.
 
 > Sınır: Model bir kişiyi **hiç** algılamazsa (çok uzak, çok karanlık, büyük kısmı kapalı) o kişi canlı görüntüde görünebilir.
 
-İnsanların arkasını doldurmak için boş ortam resmi program açılır açılmaz **beklemeden** öğrenilir; henüz bilinmeyen yerler gri görünür. Güncelleme yalnızca güvenli piksellerde yapılır:
+Ortam resmi bekleme olmadan, **her karede** güncellenir: insan olmayan (ve o an kıpırdamayan) her piksel doğrudan canlı kareden alınır. Kişinin kapattığı yere o yerin kişi gelmeden hemen önceki canlı hali konur. Bu yüzden kişi çekilince görüntü zıplamaz. Kişinin arkasında o sırada bir şey değişirse (kişi koltuğun önündeyken koltuk itilirse) kişi çekildiği an yeni hali görünür. Program açıldığında birinin durduğu, hiç boş görülmemiş yerler çevreden tahminle (bulanık) doldurulur, kişi oradan çekilince gerçek görüntü gelir. Güncel ortam 10 dakikada bir `arka_plan.png` dosyasına yazılır.
 
-- İnsan görülen bölge (iskelet ve çevresindeki pay) kilitlenir, hiç güncellenmez. Kilit, o bölge tekrar eski haline dönünce (kişi gidince) açılır. Model kişiyi sonradan kaybetse bile (yarım görünme, hareketsiz yatma) bölge kilitli kalır.
-- Henüz bilinmeyen boş yerler 3 sn kıpırdamadan durunca öğrenilir.
-- Bilinen yerdeki bir değişiklik (taşınan dolap, ışık) ancak 15 sn (`ARKA_SABIT_SN`) hiç kıpırdamadan durursa ortama işlenir. Yürüyen biri hiç işlenmez.
-- Güncel ortam 10 dakikada bir `arka_plan.png` dosyasına yazılır. Pi 3'ü yormamak için bu güncelleme saniyede yalnızca bir kez yapılır.
-
-Ortam resmi istenirse sıfırlanıp baştan öğrenilir (örneğin kilitli kalan bir bölgede eşya yer değiştirdiyse):
+Ortam resmi istenirse sıfırlanıp baştan öğrenilir:
 
 - Pencerede `k` tuşuna basmak
 - Program klasörüne `arka_plan_kaydet` adlı boş bir dosya koymak
